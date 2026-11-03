@@ -65,19 +65,19 @@ impl Store {
         // Delete old traces and LLM call payloads
         sqlx::query("DELETE FROM llm_call_requests WHERE created_at_ms < ?")
             .bind(cutoff_ms)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM llm_call_response_chunks WHERE created_at_ms < ?")
             .bind(cutoff_ms)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM cursor_run_traces WHERE created_at_ms < ?")
             .bind(cutoff_ms)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM llm_calls WHERE created_at_ms < ?")
             .bind(cutoff_ms)
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
 
         Self::clear_trace_artifacts_tx(&mut transaction).await?;
@@ -92,10 +92,10 @@ impl Store {
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
         sqlx::query("DELETE FROM llm_call_requests")
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM llm_call_response_chunks")
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         Self::clear_trace_artifacts_tx(transaction).await
     }
@@ -108,19 +108,19 @@ impl Store {
                 blob_id BLOB PRIMARY KEY
              )",
         )
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query("DELETE FROM clear_statistics_blob_ids")
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query(
             "INSERT OR IGNORE INTO clear_statistics_blob_ids(blob_id)
              SELECT blob_id FROM cursor_run_trace_artifacts",
         )
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query("DELETE FROM cursor_run_trace_artifacts")
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query(
             "DELETE FROM blobs
@@ -133,10 +133,10 @@ impl Store {
                    WHERE e.parent_blob_id = blobs.blob_id OR e.child_blob_id = blobs.blob_id
                )",
         )
-        .execute(&mut **transaction)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query("DROP TABLE clear_statistics_blob_ids")
-            .execute(&mut **transaction)
+            .execute(&mut *transaction)
             .await?;
         Ok(())
     }
