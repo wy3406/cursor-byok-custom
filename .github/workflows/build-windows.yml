@@ -1,0 +1,53 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build cursor-byok Windows Binary
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Desktop Release
+        run: |
+          cargo build --release --bin cursor-byok-desktop
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-desktop-windows
+          path: target/release/cursor-byok-desktop.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/heads/main')
+        with:
+          tag_name: v1.0.1-custom
+          name: "Cursor BYOK Custom v1.0.1 (Fixed Protobuf 3.27 + Auto Clean)"
+          draft: false
+          prerelease: false
+          files: target/release/cursor-byok-desktop.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
