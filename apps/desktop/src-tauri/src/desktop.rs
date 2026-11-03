@@ -20,11 +20,8 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(dev)]
-use cursor_server::config::ConsoleSource;
 use cursor_server::{App, Config, Result};
 
-#[cfg(not(dev))]
 use crate::frontend;
 use crate::startup::{self, StartupDiagnostics};
 use crate::tray;
@@ -217,20 +214,9 @@ pub fn run() -> ExitCode {
                 config.app_version = env!("CARGO_PKG_VERSION").into();
                 config
             };
-            #[cfg(dev)]
-            let config = {
-                let mut config = config;
-                config.console = Some(ConsoleSource::Proxy(
-                    "http://127.0.0.1:1420"
-                        .parse()
-                        .expect("Vite development URL"),
-                ));
-                config
-            };
             let server = tauri::async_runtime::block_on(App::new(config))?
-                .merge_router(desktop_api_router(app.handle().clone()));
-            #[cfg(not(dev))]
-            let server = server.merge_router(frontend::router(app.handle().clone()));
+                .merge_router(desktop_api_router(app.handle().clone()))
+                .merge_router(frontend::router(app.handle().clone()));
             let listener = tauri::async_runtime::block_on(server.bind())?;
             let address = listener.local_addr()?;
             tauri::async_runtime::block_on(server.harness().cleanup_stale_settings())?;
