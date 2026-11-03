@@ -23,17 +23,31 @@ impl Store {
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("auto_vacuum", "INCREMENTAL");
         let database_path = options.get_filename().to_owned();
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(options)
             .await?;
         migrations::run(&pool, &database_path).await?;
-        Ok(Self {
+
+        let store = Self {
             pool,
             writes: WriteCoordinator::default(),
-        })
+        };
+
+        // Automatic background trash cleaner: runs every 6 hours, purges logs/traces > 3 days old
+        let cleaner_store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)).await;
+                let _ = cleaner_store.auto_cleanup_stale_data(3).await;
+            }
+        });
+
+        Ok(store)
+
     }
 
     pub fn pool(&self) -> &SqlitePool {

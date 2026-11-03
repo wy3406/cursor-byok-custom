@@ -56,6 +56,38 @@ impl Store {
         self.statistics_storage().await
     }
 
+
+    pub async fn auto_cleanup_stale_data(&self, max_trace_age_days: i64) -> Result<()> {
+        let _write = self.writes.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let cutoff_ms = crate::store::now_ms() - (max_trace_age_days * 24 * 60 * 60 * 1000);
+
+        // Delete old traces and LLM call payloads
+        sqlx::query("DELETE FROM llm_call_requests WHERE created_at_ms < ?")
+            .bind(cutoff_ms)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query("DELETE FROM llm_call_response_chunks WHERE created_at_ms < ?")
+            .bind(cutoff_ms)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query("DELETE FROM cursor_run_traces WHERE created_at_ms < ?")
+            .bind(cutoff_ms)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query("DELETE FROM llm_calls WHERE created_at_ms < ?")
+            .bind(cutoff_ms)
+            .execute(&mut **transaction)
+            .await?;
+
+        Self::clear_trace_artifacts_tx(&mut transaction).await?;
+        transaction.commit().await?;
+
+        // Reclaim SQLite storage space via VACUUM
+        let _ = sqlx::query("PRAGMA incremental_vacuum(1000)").execute(&self.pool).await;
+        Ok(())
+    }
+
     async fn clear_detail_storage_tx(
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {

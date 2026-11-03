@@ -337,6 +337,15 @@ message AgentRunRequest {
   optional string run_id = 25;
   optional string agent_session_id = 26;
   optional bool client_supports_prompt_context_usage_rpc = 27;
+  optional bool client_supports_routed_model_update = 28;
+  optional SystemPromptSpec system_prompt_spec = 29;
+  optional ClientLlmGatewayCredential client_llm_gateway_credential = 30;
+  optional bool client_supports_preview_card = 31;
+  optional bool started_as_new_project = 32;
+  optional bool first_project_onboarding = 33;
+  optional uint32 next_interaction_query_id = 34;
+  optional VoiceCallNotes voice_call_notes = 35;
+  optional string transcript_parent_conversation_id = 36;
 }
 
 // Copied from: local:agent.v1.AgentServerMessage (var: qW)
@@ -1655,6 +1664,19 @@ message ConversationStateStructure {
   map<string, bytes> subagent_state_refs = 31;
   optional GoalState goal_state = 32;
   optional bool is_root_project_conversation = 33;
+  repeated string completed_ask_question_tool_call_ids = 34;
+  repeated string durable_skill_blocks = 35;
+  optional string durable_custom_mode_id = 36;
+  optional uint32 message_count_at_last_compaction = 37;
+  repeated string recent_user_message_ids = 38;
+  optional uint32 recent_user_message_ids_older_turn_count = 39;
+  optional TurnTelemetryState turn_telemetry = 40;
+  repeated string mentioned_agent_ids = 42;
+  repeated VoiceCallUtterance voice_call_utterances = 43;
+  optional VoiceCallPendingAnswer voice_call_pending_answer = 44;
+  repeated string voice_call_time_task_ids = 45;
+  optional bool writes_voice_call_utterances = 46;
+  optional bool voice_calls_read_utterances = 47;
 }
 
 // Copied from: local:agent.v1.ConversationStep (var: MG)
@@ -8817,4 +8839,38 @@ service TmuxSessionService {
   rpc ListSessions(ListTmuxSessionsRequest) returns (ListTmuxSessionsResponse) {}
   rpc KillSession(KillTmuxSessionRequest) returns (KillTmuxSessionResponse) {}
   rpc AttachSession(AttachTmuxSessionRequest) returns (AttachTmuxSessionResponse) {}
+}
+
+message TurnTelemetryState {
+  uint32 completed_turn_count_capped = 1;
+  optional uint64 last_completed_turn_timestamp_ms = 2;
+}
+
+message VoiceCallUtterance {
+  string id = 1;
+  int32 kind = 2;
+  string text = 3;
+  repeated string answers_message_ids = 4;
+}
+
+message VoiceCallPendingAnswer {
+  repeated string message_ids = 1;
+  bool reads_utterances = 2;
+  bool ended_on_send = 3;
+}
+
+message SystemPromptSpec {
+  oneof spec {
+    string replace = 1;
+    string append = 2;
+  }
+}
+
+message ClientLlmGatewayCredential {
+  string bearer_token = 1;
+}
+
+message VoiceCallNotes {
+  string request = 1;
+  string message_id = 2;
 }

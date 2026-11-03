@@ -41,6 +41,7 @@ export const updateStore = {
   getSnapshot: () => snapshot,
 
   async check(): Promise<string | null> {
+    return null; // Auto-update disabled in private custom edition
     if (!hasNativeAppLifecycle()) return null;
     if (pendingCheck) return pendingCheck;
     update({ checking: true });

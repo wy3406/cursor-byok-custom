@@ -284,10 +284,11 @@ impl ControlService {
 
     pub(super) async fn ads(
         &self,
-        disabled_ad_ids: Option<&str>,
-        language: &str,
+        _disabled_ad_ids: Option<&str>,
+        _language: &str,
     ) -> Result<AdRuntime> {
-        let client = self.clients.default_client().await?;
+        return Ok(AdRuntime { slots: Vec::new() });
+    }ult_client().await?;
         let installation_id = self.store.installation_id().await?;
         let mut request = client
             .get(ADS_ENDPOINT)
