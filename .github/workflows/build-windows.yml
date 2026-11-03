@@ -44,8 +44,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/heads/main')
         with:
-          tag_name: v1.0.2-custom
-          name: "Cursor BYOK Custom v1.0.2 (Protobuf 3.27 Fix + Auto Clean + Offline)"
+          tag_name: v1.0.3-custom
+          name: "Cursor BYOK Custom v1.0.3 (Protobuf 3.27 Fix + Auto Clean + Offline)"
           draft: false
           prerelease: false
           files: target/release/cursor-byok-desktop.exe
