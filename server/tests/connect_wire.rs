@@ -361,7 +361,6 @@ fn inference_run(
                     role: 1,
                     text: routing_text.into(),
                 }],
-                ..Default::default()
             },
         )),
     }
