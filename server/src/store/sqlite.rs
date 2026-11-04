@@ -47,7 +47,6 @@ impl Store {
         });
 
         Ok(store)
-
     }
 
     pub fn pool(&self) -> &SqlitePool {

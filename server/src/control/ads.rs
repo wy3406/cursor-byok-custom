@@ -33,8 +33,11 @@ pub(super) const OS_HEADER: &str = "X-Cursor-Assistant-OS";
 pub(super) const APP_VERSION_HEADER: &str = "X-Cursor-Assistant-Version";
 pub(super) const DISABLED_AD_IDS_HEADER: &str = "disable-ad-ids";
 pub(super) const LANGUAGE_HEADER: &str = "accept-language";
+#[allow(dead_code)]
 const ADS_IMAGE_ROUTE: &str = "/__byok-api__/api/promotions/images";
+#[allow(dead_code)]
 const MAX_AD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+#[allow(dead_code)]
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "gif", "webp", "avif"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +110,7 @@ pub enum AdActionType {
 }
 
 impl AdRuntime {
+    #[allow(dead_code)]
     pub(super) fn into_menu_slots(mut self) -> Result<Self> {
         self.slots
             .retain(|slot| slot.enabled && slot.placement == AdPlacement::Menu);
@@ -118,6 +122,7 @@ impl AdRuntime {
         Ok(self)
     }
 
+    #[allow(dead_code)]
     pub(super) async fn cache_images(&mut self, client: &reqwest::Client) {
         let cache_dir = match config::managed_data_dir() {
             Ok(path) => path.join("ads"),
@@ -162,6 +167,7 @@ impl AdRuntime {
     }
 }
 
+#[allow(dead_code)]
 async fn cache_image(client: &reqwest::Client, cache_dir: &FilePath, url: &str) -> Result<String> {
     tokio::fs::create_dir_all(cache_dir).await?;
     let hash = hex::encode(Sha256::digest(url.as_bytes()));
@@ -219,6 +225,7 @@ async fn cache_image(client: &reqwest::Client, cache_dir: &FilePath, url: &str) 
     Ok(format!("{ADS_IMAGE_ROUTE}/{file_name}"))
 }
 
+#[allow(dead_code)]
 async fn cached_file_name(cache_dir: &FilePath, hash: &str) -> Option<String> {
     for extension in IMAGE_EXTENSIONS {
         let file_name = format!("{hash}.{extension}");
@@ -232,6 +239,7 @@ async fn cached_file_name(cache_dir: &FilePath, hash: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn image_extension(content_type: &str) -> Option<&'static str> {
     match content_type
         .split(';')
@@ -250,6 +258,7 @@ fn image_extension(content_type: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 fn validate_http_url(value: &str, field: &str) -> Result<()> {
     let url = Url::parse(value)
         .map_err(|error| Error::Provider(format!("advertisement {field} is invalid: {error}")))?;

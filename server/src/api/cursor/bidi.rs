@@ -160,23 +160,173 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
+    let payload = agent_payload(request)?;
+    let message = agent::AgentClientMessage::decode(payload.as_slice()).map_err(|error| {
+        Error::Protocol(format!(
+            "protobuf decode error: {error}; {}",
+            wire_outline(&payload)
+        ))
+    })?;
+    Ok(DecodedAppend {
+        request_id: request_id.into(),
+        seqno: request.append_seqno,
+        message,
+    })
+}
+
+fn agent_payload(request: &ai::BidiAppendRequest) -> Result<Vec<u8>> {
     if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
+        return Ok(request.data_binary.clone());
     }
-    if request.data.is_empty() {
+    let data = request.data.trim();
+    if data.is_empty() {
         return Err(Error::Protocol(
             "BidiAppend contains no AgentClientMessage".into(),
         ));
     }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
-    Ok(DecodedAppend {
-        request_id: request_id.into(),
-        seqno: request.append_seqno,
-        message: agent::AgentClientMessage::decode(payload.as_slice())?,
+    hex::decode(data).map_err(|error| {
+        let position = match error {
+            hex::FromHexError::InvalidHexCharacter { index, .. } => index.to_string(),
+            hex::FromHexError::OddLength => "end".to_string(),
+            hex::FromHexError::InvalidStringLength => "length".to_string(),
+        };
+        Error::Protocol(format!("invalid BidiAppend hex at position {position}"))
     })
+}
+
+const WIRE_OUTLINE_TAGS: usize = 40;
+const WIRE_OUTLINE_DEPTH: usize = 4;
+
+fn wire_outline(bytes: &[u8]) -> String {
+    let mut tags = String::new();
+    let mut count = 0;
+    walk_wire(bytes, 0, 0, &mut tags, &mut count);
+    if count >= WIRE_OUTLINE_TAGS {
+        tags.push_str(" truncated");
+    }
+    format!("wire len={}{tags}", bytes.len())
+}
+
+fn walk_wire(bytes: &[u8], depth: usize, base: usize, tags: &mut String, count: &mut usize) {
+    let mut offset = 0;
+    while offset < bytes.len() && *count < WIRE_OUTLINE_TAGS {
+        let start = offset;
+        let Some((key, next)) = read_varint(bytes, offset) else {
+            push_tag(tags, depth, base + start, 0, "truncated-key", None);
+            *count += 1;
+            return;
+        };
+        offset = next;
+        if key > u64::from(u32::MAX) {
+            push_tag(tags, depth, base + start, 0, "invalid-key", None);
+            *count += 1;
+            return;
+        }
+        let field = (key >> 3) as u32;
+        let wire = (key & 7) as u8;
+        if field == 0 {
+            push_tag(tags, depth, base + start, 0, "invalid-field", None);
+            *count += 1;
+            return;
+        }
+        match wire {
+            0 => {
+                let Some((_, next)) = read_varint(bytes, offset) else {
+                    push_tag(tags, depth, base + start, field, "v", None);
+                    *count += 1;
+                    return;
+                };
+                push_tag(tags, depth, base + start, field, "v", None);
+                *count += 1;
+                offset = next;
+            }
+            1 => {
+                push_tag(tags, depth, base + start, field, "i64", None);
+                *count += 1;
+                if bytes.len() - offset < 8 {
+                    return;
+                }
+                offset += 8;
+            }
+            5 => {
+                push_tag(tags, depth, base + start, field, "i32", None);
+                *count += 1;
+                if bytes.len() - offset < 4 {
+                    return;
+                }
+                offset += 4;
+            }
+            2 => {
+                let Some((len, next)) = read_varint(bytes, offset) else {
+                    push_tag(tags, depth, base + start, field, "ld", None);
+                    *count += 1;
+                    return;
+                };
+                offset = next;
+                let len = usize::try_from(len).unwrap_or(usize::MAX);
+                push_tag(tags, depth, base + start, field, "ld", Some(len));
+                *count += 1;
+                if len > bytes.len() - offset {
+                    return;
+                }
+                if depth + 1 < WIRE_OUTLINE_DEPTH {
+                    walk_wire(
+                        &bytes[offset..offset + len],
+                        depth + 1,
+                        base + offset,
+                        tags,
+                        count,
+                    );
+                }
+                offset += len;
+            }
+            3 => {
+                push_tag(tags, depth, base + start, field, "sg", None);
+                *count += 1;
+            }
+            4 => {
+                push_tag(tags, depth, base + start, field, "eg", None);
+                *count += 1;
+                return;
+            }
+            other => {
+                push_tag(tags, depth, base + start, field, "w", Some(other as usize));
+                *count += 1;
+                return;
+            }
+        }
+    }
+}
+
+fn push_tag(
+    tags: &mut String,
+    depth: usize,
+    offset: usize,
+    field: u32,
+    wire: &str,
+    extra: Option<usize>,
+) {
+    tags.push(' ');
+    tags.push_str(&format!("d{depth}@{offset}#{field}/{wire}"));
+    if let Some(extra) = extra {
+        tags.push(':');
+        tags.push_str(&extra.to_string());
+    }
+}
+
+fn read_varint(bytes: &[u8], mut offset: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while offset < bytes.len() && shift < 64 {
+        let byte = bytes[offset];
+        offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, offset));
+        }
+        shift += 7;
+    }
+    None
 }
 
 pub async fn append(

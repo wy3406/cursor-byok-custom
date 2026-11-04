@@ -138,3 +138,106 @@ async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     assert!(text.contains("BidiAppend contains no AgentClientMessage"));
     assert!(!text.contains("protobuf decode error"));
 }
+
+fn run_with_state(state: pb::ConversationStateStructure) -> pb::AgentClientMessage {
+    pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::RunRequest(
+            pb::AgentRunRequest {
+                conversation_state: Some(state),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn append_request(payload: Vec<u8>, binary: bool) -> ai::BidiAppendRequest {
+    ai::BidiAppendRequest {
+        data: if binary {
+            String::new()
+        } else {
+            hex::encode(&payload)
+        },
+        request_id: Some(ai::BidiRequestId {
+            request_id: "req".into(),
+        }),
+        append_seqno: 0,
+        data_binary: if binary { payload } else { Vec::new() },
+    }
+}
+
+fn summary_of(message: pb::AgentClientMessage) -> Option<Vec<u8>> {
+    let Some(pb::agent_client_message::Message::RunRequest(request)) = message.message else {
+        panic!("expected run request");
+    };
+    request.conversation_state.unwrap().summary
+}
+
+#[test]
+fn blank_and_existing_conversation_state_roundtrip_through_hex_and_binary() {
+    let blank = run_with_state(pb::ConversationStateStructure::default());
+    let blank_bytes = blank.encode_to_vec();
+    let decoded = cursor::bidi::decode(&append_request(blank_bytes, false)).unwrap();
+    assert_eq!(summary_of(decoded.message), None);
+
+    let existing = run_with_state(pb::ConversationStateStructure {
+        turns: vec![b"turn-blob".to_vec()],
+        summary: Some(b"summary-blob".to_vec()),
+        ..Default::default()
+    });
+    let existing_bytes = existing.encode_to_vec();
+    for binary in [false, true] {
+        let decoded =
+            cursor::bidi::decode(&append_request(existing_bytes.clone(), binary)).unwrap();
+        assert_eq!(
+            summary_of(decoded.message).as_deref(),
+            Some(b"summary-blob".as_slice())
+        );
+    }
+}
+
+#[test]
+fn fixed32_summary_keeps_the_wire_mismatch_and_omits_payload_bytes() {
+    let state = fixed32_field(6, 0x1122_3344);
+    let run = length_delimited(1, &state);
+    let message = length_delimited(1, &run);
+    let error = cursor::bidi::decode(&append_request(message, false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ThirtyTwoBit"));
+    assert!(error.contains("#6/i32"));
+    assert!(!error.contains("11223344"));
+    assert!(!error.contains("44332211"));
+    assert!(!error.contains("summary-blob"));
+}
+
+fn length_delimited(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = proto_key(field, 2);
+    out.extend(proto_varint(payload.len() as u64));
+    out.extend(payload);
+    out
+}
+
+fn fixed32_field(field: u32, value: u32) -> Vec<u8> {
+    let mut out = proto_key(field, 5);
+    out.extend(value.to_le_bytes());
+    out
+}
+
+fn proto_key(field: u32, wire_type: u32) -> Vec<u8> {
+    proto_varint(u64::from((field << 3) | wire_type))
+}
+
+fn proto_varint(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return out;
+        }
+    }
+}

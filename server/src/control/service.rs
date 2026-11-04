@@ -13,8 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::ads::{
-    AdDismissalInput, AdRuntime, ADS_ENDPOINT, APP_VERSION_HEADER, DEVICE_ID_HEADER,
-    DISABLED_AD_IDS_HEADER, LANGUAGE_HEADER, OS_HEADER,
+    AdDismissalInput, AdRuntime, ADS_ENDPOINT, APP_VERSION_HEADER, DEVICE_ID_HEADER, OS_HEADER,
 };
 
 use crate::{
