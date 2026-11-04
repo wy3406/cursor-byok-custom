@@ -172,11 +172,25 @@ fn summary_of(message: pb::AgentClientMessage) -> Option<Vec<u8>> {
     request.conversation_state.unwrap().summary
 }
 
+fn must_decode(request: ai::BidiAppendRequest) -> cursor::bidi::DecodedAppend {
+    match cursor::bidi::decode(&request) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+fn must_fail(request: ai::BidiAppendRequest) -> String {
+    match cursor::bidi::decode(&request) {
+        Ok(_) => panic!("expected BidiAppend decode to fail"),
+        Err(error) => error.to_string(),
+    }
+}
+
 #[test]
 fn blank_and_existing_conversation_state_roundtrip_through_hex_and_binary() {
     let blank = run_with_state(pb::ConversationStateStructure::default());
     let blank_bytes = blank.encode_to_vec();
-    let decoded = cursor::bidi::decode(&append_request(blank_bytes, false)).unwrap();
+    let decoded = must_decode(append_request(blank_bytes, false));
     assert_eq!(summary_of(decoded.message), None);
 
     let existing = run_with_state(pb::ConversationStateStructure {
@@ -186,8 +200,7 @@ fn blank_and_existing_conversation_state_roundtrip_through_hex_and_binary() {
     });
     let existing_bytes = existing.encode_to_vec();
     for binary in [false, true] {
-        let decoded =
-            cursor::bidi::decode(&append_request(existing_bytes.clone(), binary)).unwrap();
+        let decoded = must_decode(append_request(existing_bytes.clone(), binary));
         assert_eq!(
             summary_of(decoded.message).as_deref(),
             Some(b"summary-blob".as_slice())
@@ -200,9 +213,7 @@ fn fixed32_summary_keeps_the_wire_mismatch_and_omits_payload_bytes() {
     let state = fixed32_field(6, 0x1122_3344);
     let run = length_delimited(1, &state);
     let message = length_delimited(1, &run);
-    let error = cursor::bidi::decode(&append_request(message, false))
-        .unwrap_err()
-        .to_string();
+    let error = must_fail(append_request(message, false));
     assert!(error.contains("ThirtyTwoBit"));
     assert!(error.contains("#6/i32"));
     assert!(!error.contains("11223344"));
