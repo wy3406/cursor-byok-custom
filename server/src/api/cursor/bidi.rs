@@ -6,7 +6,7 @@ use crate::{
         conversation::TransportCommand,
         protocol::{
             events,
-            proto::{agent::v1 as agent, aiserver::v1 as ai},
+            proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as inf},
         },
         transport::{TransportParent, TransportRegistry},
     },
@@ -153,13 +153,179 @@ fn history_image_count(history: &agent::ConversationHistory) -> usize {
         .sum()
 }
 
-pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
-    let request_id = request
+#[allow(clippy::large_enum_variant)]
+pub enum ClientAppend {
+    Agent(DecodedAppend),
+    Inference(InferenceAppend),
+}
+
+pub struct InferenceAppend {
+    pub request_id: String,
+    pub seqno: i64,
+    pub message: inf::run_inference_client_message::Message,
+}
+
+impl ClientAppend {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Agent(append) => append.request_id.as_str(),
+            Self::Inference(append) => append.request_id.as_str(),
+        }
+    }
+
+    pub fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent(append) => append.model_id(),
+            Self::Inference(append) => inference_model_id(&append.message),
+        }
+    }
+
+    pub fn conversation_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent(append) => append.conversation_id(),
+            Self::Inference(append) => inference_conversation_id(&append.message),
+        }
+    }
+
+    pub fn trace_metadata(&self) -> serde_json::Value {
+        match self {
+            Self::Agent(append) => append.trace_metadata(),
+            Self::Inference(append) => inference_trace(append),
+        }
+    }
+}
+
+pub fn decode_client(request: &ai::BidiAppendRequest) -> Result<ClientAppend> {
+    let request_id = required_request_id(request)?;
+    let payload = agent_payload(request)?;
+    if let Ok(message) = agent::AgentClientMessage::decode(payload.as_slice()) {
+        if message.message.is_some() {
+            return Ok(ClientAppend::Agent(DecodedAppend {
+                request_id,
+                seqno: request.append_seqno,
+                message,
+            }));
+        }
+    }
+    if let Ok(message) = inf::RunInferenceClientMessage::decode(payload.as_slice()) {
+        if let Some(message) = message.message.filter(inference_arm_plausible) {
+            return Ok(ClientAppend::Inference(InferenceAppend {
+                request_id,
+                seqno: request.append_seqno,
+                message,
+            }));
+        }
+    }
+    decode(request).map(ClientAppend::Agent)
+}
+
+fn required_request_id(request: &ai::BidiAppendRequest) -> Result<String> {
+    request
         .request_id
         .as_ref()
-        .map(|id| id.request_id.as_str())
+        .map(|id| id.request_id.clone())
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
+        .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))
+}
+
+fn inference_arm_plausible(message: &inf::run_inference_client_message::Message) -> bool {
+    use inf::run_inference_client_message::Message;
+    match message {
+        Message::RunRequest(request) => looks_like_uuid(&request.conversation_id),
+        Message::InvokeModel(invoke) => !invoke.invocation_id.is_empty(),
+        Message::CancelInvocation(cancel) => !cancel.invocation_id.is_empty(),
+        Message::FinishRun(_) | Message::ClientHeartbeat(_) => true,
+    }
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn inference_model_id(message: &inf::run_inference_client_message::Message) -> Option<&str> {
+    use inf::run_inference_client_message::Message;
+    let model_id = match message {
+        Message::RunRequest(request) => request
+            .requested_model
+            .as_ref()
+            .map(|model| model.model_id.as_str()),
+        Message::InvokeModel(invoke) => {
+            let request = invoke.request.as_ref()?;
+            if !request.model_id.is_empty() {
+                return Some(request.model_id.as_str());
+            }
+            request
+                .requested_model
+                .as_ref()
+                .map(|model| model.model_id.as_str())
+        }
+        _ => None,
+    };
+    model_id.filter(|model| !model.is_empty())
+}
+
+fn inference_conversation_id(message: &inf::run_inference_client_message::Message) -> Option<&str> {
+    use inf::run_inference_client_message::Message;
+    let conversation_id = match message {
+        Message::RunRequest(request) => request.conversation_id.as_str(),
+        Message::InvokeModel(invoke) => invoke
+            .request
+            .as_ref()
+            .map(|request| request.conversation_id.as_str())
+            .unwrap_or(""),
+        _ => "",
+    };
+    if conversation_id.is_empty() {
+        None
+    } else {
+        Some(conversation_id)
+    }
+}
+
+fn inference_trace(append: &InferenceAppend) -> serde_json::Value {
+    use inf::run_inference_client_message::Message;
+    match &append.message {
+        Message::RunRequest(request) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_run_request",
+            "conversation_id": request.conversation_id,
+            "model_id": inference_model_id(&append.message),
+            "routing_messages": request.routing_conversation.len(),
+        }),
+        Message::InvokeModel(invoke) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_invoke_model",
+            "invocation_id": invoke.invocation_id,
+            "message_count": invoke.request.as_ref().map(|request| request.messages.len()).unwrap_or(0),
+            "compressed": invoke.compressed_request.is_some(),
+        }),
+        Message::CancelInvocation(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_cancel_invocation",
+        }),
+        Message::FinishRun(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_finish_run",
+        }),
+        Message::ClientHeartbeat(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_client_heartbeat",
+        }),
+    }
+}
+
+pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
+    let request_id = required_request_id(request)?;
     let payload = agent_payload(request)?;
     let message = agent::AgentClientMessage::decode(payload.as_slice()).map_err(|error| {
         Error::Protocol(format!(
@@ -168,7 +334,7 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         ))
     })?;
     Ok(DecodedAppend {
-        request_id: request_id.into(),
+        request_id,
         seqno: request.append_seqno,
         message,
     })

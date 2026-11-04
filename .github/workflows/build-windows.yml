@@ -40,8 +40,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/heads/main')
         with:
-          tag_name: v1.0.5-custom
-          name: "Cursor BYOK Custom v1.0.5 (wire outline + raw BidiAppend)"
+          tag_name: v1.0.6-custom
+          name: "Cursor BYOK Custom v1.0.6 (local-loop RunInference)"
           draft: false
           prerelease: false
           files: target/release/cursor-byok-desktop.exe

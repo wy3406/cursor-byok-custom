@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package inference.v1;
+
+// Local-loop RunInference messages. Field numbers follow the Cursor agent host
+// schema. Unknown fields stay skipped so the server only reads what it answers.
+
+message RunInferenceClientMessage {
+  oneof message {
+    RunInferenceRunRequest run_request = 1;
+    RunInferenceInvokeModel invoke_model = 2;
+    RunInferenceCancelInvocation cancel_invocation = 3;
+    RunInferenceFinishRun finish_run = 4;
+    RunInferenceClientHeartbeat client_heartbeat = 5;
+  }
+}
+
+message RunInferenceRunRequest {
+  string conversation_id = 1;
+  InferenceRequestedModel requested_model = 3;
+  repeated RunInferenceRoutingMessage routing_conversation = 4;
+}
+
+message RunInferenceRoutingMessage {
+  int32 role = 1;
+  string text = 2;
+}
+
+message InferenceRequestedModel {
+  string model_id = 1;
+  bool max_mode = 2;
+  repeated InferenceModelParameterValue parameters = 3;
+  bool built_in_model = 4;
+}
+
+message InferenceModelParameterValue {
+  string id = 1;
+  string value = 2;
+}
+
+message RunInferenceInvokeModel {
+  string invocation_id = 1;
+  InferenceStreamRequest request = 2;
+  RunInferenceCompressedRequest compressed_request = 7;
+}
+
+message RunInferenceCompressedRequest {
+  int32 encoding = 1;
+  uint32 decoded_size = 2;
+  bytes data = 3;
+}
+
+message RunInferenceCancelInvocation {
+  string invocation_id = 1;
+}
+
+message RunInferenceFinishRun {
+  bool aborted = 1;
+}
+
+message RunInferenceClientHeartbeat {}
+
+message InferenceStreamRequest {
+  repeated InferenceCoreMessage messages = 1;
+  string model_id = 5;
+  InferenceRequestedModel requested_model = 7;
+  string conversation_id = 8;
+}
+
+message InferenceCoreMessage {
+  int32 role = 1;
+  oneof content {
+    string text = 2;
+    InferenceContentParts parts = 3;
+    InferenceToolResultContent tool_content = 6;
+  }
+}
+
+message InferenceContentParts {
+  repeated InferenceContentPart parts = 1;
+}
+
+message InferenceContentPart {
+  oneof part {
+    InferenceTextPart text = 1;
+    InferenceImagePart image = 2;
+    InferenceFilePart file = 3;
+  }
+}
+
+message InferenceTextPart {
+  string text = 1;
+}
+
+message InferenceImagePart {
+  string data = 1;
+  string mime_type = 2;
+}
+
+message InferenceFilePart {
+  string data = 1;
+  string media_type = 2;
+  string filename = 3;
+}
+
+message InferenceToolResultContent {
+  repeated InferenceToolResultPart parts = 1;
+}
+
+message InferenceToolResultPart {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  // Serialized google.protobuf.Value. Bytes and a nested message share the
+  // length-delimited wire type, so the value is decoded after the message.
+  bytes result = 3;
+  bool is_error = 4;
+}
+
+message RunInferenceServerMessage {
+  oneof message {
+    RunInferenceHeartbeat heartbeat = 1;
+    RunInferenceRunReady run_ready = 2;
+    RunInferenceInvocationResponse invocation_response = 3;
+    RunInferenceInvocationEnd invocation_end = 4;
+  }
+}
+
+message RunInferenceHeartbeat {
+  bool accepts_speculative_invocations = 1;
+}
+
+message RunInferenceRunReady {
+  InferenceRequestedModel resolved_model = 1;
+  bool accepts_client_heartbeat = 7;
+}
+
+message RunInferenceInvocationResponse {
+  string invocation_id = 1;
+  InferenceStreamResponse response = 2;
+}
+
+message InferenceStreamResponse {
+  oneof response {
+    InferenceTextStreamPart text_part = 1;
+    InferenceThinkingStreamPart thinking_part = 9;
+  }
+}
+
+message InferenceTextStreamPart {
+  string text = 1;
+  bool is_final = 2;
+}
+
+message InferenceThinkingStreamPart {
+  string text = 1;
+  bool is_final = 3;
+}
+
+message RunInferenceInvocationEnd {
+  string invocation_id = 1;
+  RunInferenceInvocationError error = 2;
+}
+
+message RunInferenceInvocationError {
+  int32 code = 1;
+  string message = 2;
+}

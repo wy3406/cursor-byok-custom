@@ -10,7 +10,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
     api::cursor::{
-        bidi,
+        bidi, inference,
         proxy::{self, CursorProxy},
         run_sse,
     },
@@ -232,33 +232,33 @@ async fn bidi_handler(
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
-    let decoded = bidi::decode(&request)?;
+    let decoded = bidi::decode_client(&request)?;
     let first_model = decoded.model_id().map(str::to_owned);
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
-    let trace = registry.trace(&decoded.request_id);
+    let trace = registry.trace(decoded.request_id());
     let local = if let Some(model_id) = decoded.model_id() {
         // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
         if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
             || registry.store().model(model_id).await?.is_some()
         {
             tracing::info!(
-                request_id = decoded.request_id,
+                request_id = decoded.request_id(),
                 model_id,
                 "routing Cursor Run to BYOK provider"
             );
             true
         } else {
             tracing::info!(
-                request_id = decoded.request_id,
+                request_id = decoded.request_id(),
                 model_id,
                 "routing Cursor Run to Cursor upstream"
             );
             false
         }
-    } else if registry.local(&decoded.request_id).await.is_some() {
+    } else if registry.local(decoded.request_id()).await.is_some() {
         true
-    } else if registry.upstream(&decoded.request_id).await {
+    } else if registry.upstream(decoded.request_id()).await {
         false
     } else {
         trace.resume();
@@ -286,7 +286,7 @@ async fn bidi_handler(
     }
     if !local {
         if first_model.is_some() {
-            registry.mark_upstream(&decoded.request_id).await;
+            registry.mark_upstream(decoded.request_id()).await;
         }
         trace.request(
             "bidi_request",
@@ -315,7 +315,22 @@ async fn bidi_handler(
             return Err(error);
         }
     };
-    match bidi::append(&registry, decoded, parent).await {
+    let appended = match decoded {
+        bidi::ClientAppend::Agent(decoded) => {
+            bidi::append(&registry, decoded, parent).await.map(|_| ())
+        }
+        bidi::ClientAppend::Inference(decoded) => {
+            inference::accept(
+                &registry,
+                &decoded.request_id,
+                decoded.seqno,
+                decoded.message,
+                parent,
+            )
+            .await
+        }
+    };
+    match appended {
         Ok(_) => trace.request(
             "bidi_request",
             body,

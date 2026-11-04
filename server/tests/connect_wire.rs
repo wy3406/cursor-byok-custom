@@ -18,7 +18,7 @@ use cursor_server::{
     cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::protocol::{
         connect,
-        proto::{agent::v1 as pb, aiserver::v1 as ai},
+        proto::{agent::v1 as pb, aiserver::v1 as ai, inference::v1 as inf},
     },
     cursor::transport::TransportRegistry,
     network::NetworkClients,
@@ -205,6 +205,232 @@ fn blank_and_existing_conversation_state_roundtrip_through_hex_and_binary() {
             summary_of(decoded.message).as_deref(),
             Some(b"summary-blob".as_slice())
         );
+    }
+}
+
+#[test]
+fn local_loop_uuid_decodes_as_conversation_id() {
+    for conversation_id in [
+        "66666666-6666-4666-8666-666666666666",
+        "88888888-8888-4888-8888-888888888888",
+    ] {
+        let payload = inference_run(conversation_id, "model-alpha", "ping").encode_to_vec();
+        let agent_error = must_fail(append_request(payload.clone(), false));
+        assert!(agent_error.contains("conversation_state"), "{agent_error}");
+        assert!(!agent_error.contains(conversation_id), "{agent_error}");
+        assert!(!agent_error.contains("ping"), "{agent_error}");
+        assert!(!agent_error.contains("model-alpha"), "{agent_error}");
+        if conversation_id.starts_with('6') {
+            assert!(
+                agent_error.contains("invalid wire type value: 6"),
+                "{agent_error}"
+            );
+        } else {
+            assert!(agent_error.contains("Varint"), "{agent_error}");
+            assert!(agent_error.contains("plan"), "{agent_error}");
+        }
+        for binary in [false, true] {
+            let decoded = must_decode_client(append_request(payload.clone(), binary));
+            let cursor::bidi::ClientAppend::Inference(append) = decoded else {
+                panic!("expected the local-loop run request");
+            };
+            let inf::run_inference_client_message::Message::RunRequest(request) = append.message
+            else {
+                panic!("expected an inference run request");
+            };
+            assert_eq!(request.conversation_id, conversation_id);
+            assert_eq!(request.requested_model.unwrap().model_id, "model-alpha");
+            assert_eq!(request.routing_conversation[0].text, "ping");
+        }
+    }
+}
+
+#[test]
+fn existing_conversation_state_stays_on_the_agent_path() {
+    let payload = run_with_state(pb::ConversationStateStructure {
+        summary: Some(b"summary-blob".to_vec()),
+        ..Default::default()
+    })
+    .encode_to_vec();
+    let decoded = must_decode_client(append_request(payload, false));
+    let cursor::bidi::ClientAppend::Agent(decoded) = decoded else {
+        panic!("expected an agent run request");
+    };
+    assert_eq!(
+        summary_of(decoded.message).as_deref(),
+        Some(b"summary-blob".as_slice())
+    );
+}
+
+#[test]
+fn inference_prompt_keeps_user_text_and_tool_result() {
+    let request = inf::InferenceStreamRequest {
+        messages: vec![
+            core_text(4, "stay brief"),
+            core_parts(1, "status-check"),
+            inf::InferenceCoreMessage {
+                role: 3,
+                content: Some(inf::inference_core_message::Content::ToolContent(
+                    inf::InferenceToolResultContent {
+                        parts: vec![inf::InferenceToolResultPart {
+                            tool_call_id: "call-1".into(),
+                            tool_name: "lookup".into(),
+                            result: length_delimited(3, b"tool-out"),
+                            is_error: false,
+                        }],
+                    },
+                )),
+            },
+        ],
+        model_id: "model-alpha".into(),
+        ..Default::default()
+    };
+    let projected = cursor::inference::project_prompt(&request, "fallback").unwrap();
+    assert_eq!(projected.prompt.instructions, "stay brief");
+    assert_eq!(projected.model.model_id, "model-alpha");
+    assert_eq!(projected.history.len(), 2);
+    assert!(history_text(&projected.history[0]).contains("status-check"));
+    assert!(history_text(&projected.history[1]).contains("tool-out"));
+    assert!(!history_text(&projected.history[1]).contains("fallback"));
+}
+
+#[test]
+fn inference_server_frames_use_the_local_loop_field_numbers() {
+    let ready = inf::RunInferenceServerMessage {
+        message: Some(inf::run_inference_server_message::Message::RunReady(
+            inf::RunInferenceRunReady {
+                resolved_model: Some(inf::InferenceRequestedModel {
+                    model_id: "model-alpha".into(),
+                    ..Default::default()
+                }),
+                accepts_client_heartbeat: true,
+            },
+        )),
+    };
+    let ready_bytes = ready.encode_to_vec();
+    assert_eq!(ready_bytes[0], 0x12, "run_ready is field 2");
+
+    let text = inference_text("invoke-1", "ping", false);
+    let text_bytes = text.encode_to_vec();
+    assert_eq!(text_bytes[0], 0x1a, "invocation_response is field 3");
+    let decoded = inf::RunInferenceServerMessage::decode(text_bytes.as_slice()).unwrap();
+    let inf::run_inference_server_message::Message::InvocationResponse(response) =
+        decoded.message.unwrap()
+    else {
+        panic!("expected an invocation response");
+    };
+    let inf::inference_stream_response::Response::TextPart(part) =
+        response.response.unwrap().response.unwrap()
+    else {
+        panic!("expected a text part");
+    };
+    assert_eq!(part.text, "ping");
+    assert!(!part.is_final);
+
+    let finished = inference_text("invoke-1", "", true);
+    let decoded =
+        inf::RunInferenceServerMessage::decode(finished.encode_to_vec().as_slice()).unwrap();
+    let inf::run_inference_server_message::Message::InvocationResponse(response) =
+        decoded.message.unwrap()
+    else {
+        panic!("expected a final text part");
+    };
+    let inf::inference_stream_response::Response::TextPart(part) =
+        response.response.unwrap().response.unwrap()
+    else {
+        panic!("expected a text part");
+    };
+    assert!(part.is_final);
+    assert!(part.text.is_empty());
+}
+
+fn inference_run(
+    conversation_id: &str,
+    model_id: &str,
+    routing_text: &str,
+) -> inf::RunInferenceClientMessage {
+    inf::RunInferenceClientMessage {
+        message: Some(inf::run_inference_client_message::Message::RunRequest(
+            inf::RunInferenceRunRequest {
+                conversation_id: conversation_id.into(),
+                requested_model: Some(inf::InferenceRequestedModel {
+                    model_id: model_id.into(),
+                    ..Default::default()
+                }),
+                routing_conversation: vec![inf::RunInferenceRoutingMessage {
+                    role: 1,
+                    text: routing_text.into(),
+                }],
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn inference_text(
+    invocation_id: &str,
+    text: &str,
+    is_final: bool,
+) -> inf::RunInferenceServerMessage {
+    inf::RunInferenceServerMessage {
+        message: Some(
+            inf::run_inference_server_message::Message::InvocationResponse(
+                inf::RunInferenceInvocationResponse {
+                    invocation_id: invocation_id.into(),
+                    response: Some(inf::InferenceStreamResponse {
+                        response: Some(inf::inference_stream_response::Response::TextPart(
+                            inf::InferenceTextStreamPart {
+                                text: text.into(),
+                                is_final,
+                            },
+                        )),
+                    }),
+                },
+            ),
+        ),
+    }
+}
+
+fn core_text(role: i32, text: &str) -> inf::InferenceCoreMessage {
+    inf::InferenceCoreMessage {
+        role,
+        content: Some(inf::inference_core_message::Content::Text(text.into())),
+    }
+}
+
+fn core_parts(role: i32, text: &str) -> inf::InferenceCoreMessage {
+    inf::InferenceCoreMessage {
+        role,
+        content: Some(inf::inference_core_message::Content::Parts(
+            inf::InferenceContentParts {
+                parts: vec![inf::InferenceContentPart {
+                    part: Some(inf::inference_content_part::Part::Text(
+                        inf::InferenceTextPart { text: text.into() },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn history_text(message: &cursor_server::model::ProjectedMessage) -> String {
+    match &message.content {
+        cursor_server::model::ProjectedContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                cursor_server::model::ContentPart::Text { text } => text.clone(),
+                cursor_server::model::ContentPart::Image { .. } => String::new(),
+            })
+            .collect(),
+        cursor_server::model::ProjectedContent::Assistant { text, .. } => text.clone(),
+        cursor_server::model::ProjectedContent::ToolResult(result) => result.content.clone(),
+    }
+}
+
+fn must_decode_client(request: ai::BidiAppendRequest) -> cursor::bidi::ClientAppend {
+    match cursor::bidi::decode_client(&request) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!("{error}"),
     }
 }
 
