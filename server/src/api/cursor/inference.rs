@@ -492,8 +492,7 @@ async fn open_run(handle: &TransportHandle, request: RunInferenceRunRequest) -> 
     let heartbeats = session.heartbeats.clone();
     table.insert(handle.request_id().to_owned(), session);
     drop(table);
-    spawn_heartbeats(handle.clone(), heartbeats);
-    emit_heartbeat(handle)?;
+    let model_id = model.model_id.clone();
     emit(
         handle,
         &server(run_inference_server_message::Message::RunReady(
@@ -502,7 +501,14 @@ async fn open_run(handle: &TransportHandle, request: RunInferenceRunRequest) -> 
                 accepts_client_heartbeat: true,
             },
         )),
-    )
+    )?;
+    spawn_heartbeats(handle.clone(), heartbeats);
+    tracing::info!(
+        request_id = handle.request_id(),
+        model_id,
+        "inference run ready"
+    );
+    Ok(())
 }
 
 async fn start_invocation(
