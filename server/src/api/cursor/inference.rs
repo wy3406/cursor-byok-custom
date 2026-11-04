@@ -7,6 +7,7 @@
 
 use std::{collections::HashMap, io::Read, sync::OnceLock, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use prost::Message;
@@ -45,6 +46,7 @@ const ROLE_SYSTEM: i32 = 4;
 const ENCODING_ZSTD: i32 = 1;
 const ENCODING_GZIP: i32 = 2;
 const MAX_INFERENCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
 struct Session {
@@ -112,39 +114,31 @@ pub async fn accept(
     }
 }
 
-pub fn project_prompt(
+pub async fn project_prompt(
     request: &InferenceStreamRequest,
     routing_fallback: &str,
 ) -> Result<ModelRequest> {
     let mut instructions = String::new();
     let mut history = Vec::new();
     for (index, message) in request.messages.iter().enumerate() {
-        let text = message_text(message);
-        if text.is_empty() {
+        let parts = message_parts(message).await?;
+        if parts.is_empty() {
             continue;
         }
         match message.role {
-            ROLE_SYSTEM => {
-                if !instructions.is_empty() {
-                    instructions.push('\n');
-                }
-                instructions.push_str(&text);
-            }
-            ROLE_ASSISTANT => history.push(ProjectedMessage {
+            ROLE_SYSTEM => push_system(&mut instructions, &mut history, index, parts),
+            ROLE_ASSISTANT if parts_are_text(&parts) => history.push(ProjectedMessage {
                 message_id: format!("inference-{index}"),
                 role: Role::Assistant,
                 content: ProjectedContent::Assistant {
-                    text,
+                    text: join_text(&parts),
                     thinking: String::new(),
                     replay_state: None,
                     calls: Vec::new(),
                 },
             }),
-            _ => history.push(ProjectedMessage {
-                message_id: format!("inference-{index}"),
-                role: Role::User,
-                content: ProjectedContent::Parts(vec![ContentPart::Text { text }]),
-            }),
+            ROLE_ASSISTANT => history.push(projected_parts(index, Role::Assistant, parts)),
+            _ => history.push(projected_parts(index, Role::User, parts)),
         }
     }
     if !history
@@ -161,7 +155,9 @@ pub fn project_prompt(
         });
     }
     if history.is_empty() {
-        return Err(Error::Protocol("inference request has no user text".into()));
+        return Err(Error::Protocol(
+            "inference request has no user content".into(),
+        ));
     }
     if instructions.is_empty() {
         instructions = "Reply to the latest user message.".into();
@@ -177,49 +173,279 @@ pub fn project_prompt(
     })
 }
 
-fn message_text(message: &InferenceCoreMessage) -> String {
-    match &message.content {
-        Some(inference_core_message::Content::Text(text)) => text.clone(),
-        Some(inference_core_message::Content::Parts(parts)) => parts
-            .parts
-            .iter()
-            .filter_map(part_text)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(inference_core_message::Content::ToolContent(content)) => content
-            .parts
-            .iter()
-            .map(|part| {
-                let body = value_text(&part.result);
-                if part.tool_name.is_empty() {
-                    body
-                } else if body.is_empty() {
-                    format!("Tool result ({})", part.tool_name)
-                } else {
-                    format!("Tool result ({}): {body}", part.tool_name)
+fn push_system(
+    instructions: &mut String,
+    history: &mut Vec<ProjectedMessage>,
+    index: usize,
+    parts: Vec<ContentPart>,
+) {
+    let mut media = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => {
+                if text.is_empty() {
+                    continue;
                 }
-            })
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
+                if !instructions.is_empty() {
+                    instructions.push('\n');
+                }
+                instructions.push_str(&text);
+            }
+            image => media.push(image),
+        }
+    }
+    if !media.is_empty() {
+        history.push(projected_parts(index, Role::User, media));
     }
 }
 
-fn part_text(part: &InferenceContentPart) -> Option<String> {
+fn projected_parts(index: usize, role: Role, parts: Vec<ContentPart>) -> ProjectedMessage {
+    ProjectedMessage {
+        message_id: format!("inference-{index}"),
+        role,
+        content: ProjectedContent::Parts(parts),
+    }
+}
+
+fn parts_are_text(parts: &[ContentPart]) -> bool {
+    parts
+        .iter()
+        .all(|part| matches!(part, ContentPart::Text { .. }))
+}
+
+fn join_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn message_parts(message: &InferenceCoreMessage) -> Result<Vec<ContentPart>> {
+    match &message.content {
+        Some(inference_core_message::Content::Text(text)) => {
+            if text.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![ContentPart::Text { text: text.clone() }])
+            }
+        }
+        Some(inference_core_message::Content::Parts(parts)) => {
+            let mut output = Vec::new();
+            for part in &parts.parts {
+                if let Some(part) = content_part(part).await? {
+                    output.push(part);
+                }
+            }
+            Ok(output)
+        }
+        Some(inference_core_message::Content::ToolContent(content)) => {
+            let text = content
+                .parts
+                .iter()
+                .map(|part| {
+                    let body = value_text(&part.result);
+                    if part.tool_name.is_empty() {
+                        body
+                    } else if body.is_empty() {
+                        format!("Tool result ({})", part.tool_name)
+                    } else {
+                        format!("Tool result ({}): {body}", part.tool_name)
+                    }
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![ContentPart::Text { text }])
+            }
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn content_part(part: &InferenceContentPart) -> Result<Option<ContentPart>> {
     match &part.part {
         Some(inference_content_part::Part::Text(text)) if !text.text.is_empty() => {
-            Some(text.text.clone())
+            Ok(Some(ContentPart::Text {
+                text: text.text.clone(),
+            }))
         }
-        Some(inference_content_part::Part::Image(_)) => {
-            Some("（这轮附有图片，本地循环只把文字交给模型）".into())
+        Some(inference_content_part::Part::Image(image)) => {
+            Ok(Some(attached_media(&image.data, &image.mime_type).await?))
         }
-        Some(inference_content_part::Part::File(file)) => Some(format!(
-            "（这轮附有文件 {}，本地循环只把文字交给模型）",
-            file.filename
-        )),
-        _ => None,
+        Some(inference_content_part::Part::File(file))
+            if visual_hint(&file.media_type, &file.data) =>
+        {
+            Ok(Some(attached_media(&file.data, &file.media_type).await?))
+        }
+        Some(inference_content_part::Part::File(file)) => {
+            let name = if file.filename.is_empty() {
+                "file"
+            } else {
+                file.filename.as_str()
+            };
+            Ok(Some(ContentPart::Text {
+                text: format!("[File: {name}]"),
+            }))
+        }
+        _ => Ok(None),
     }
+}
+
+fn visual_hint(mime: &str, data: &str) -> bool {
+    is_visual_mime(mime)
+        || data.trim().starts_with("data:image/")
+        || data.trim().starts_with("data:video/")
+}
+
+pub async fn attached_media(data: &str, mime_hint: &str) -> Result<ContentPart> {
+    let data = data.trim();
+    if data.is_empty() {
+        return Err(Error::Protocol("attached media is empty".into()));
+    }
+    if let Some(url) = remote_url(data) {
+        return fetch_remote_media(url, mime_hint).await;
+    }
+    let (mime, bytes) = inline_media(data, mime_hint)?;
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return Err(Error::Protocol(
+            "attached media exceeds the size limit".into(),
+        ));
+    }
+    if !is_visual_mime(&mime) {
+        return Err(Error::Protocol(format!(
+            "attached media type {mime} is not an image or video"
+        )));
+    }
+    Ok(ContentPart::Image {
+        mime_type: mime,
+        data: bytes,
+    })
+}
+
+fn remote_url(data: &str) -> Option<&str> {
+    if data.starts_with("https://") || data.starts_with("http://") {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+fn inline_media(data: &str, mime_hint: &str) -> Result<(String, Vec<u8>)> {
+    if let Some(rest) = data.strip_prefix("data:") {
+        let (header, payload) = rest
+            .split_once(',')
+            .ok_or_else(|| Error::Protocol("attached media data URL has no payload".into()))?;
+        let declared = header.split(';').next().unwrap_or("").trim();
+        let bytes = if header.split(';').any(|part| part.trim() == "base64") {
+            decode_base64(payload)?
+        } else {
+            payload.as_bytes().to_vec()
+        };
+        return Ok((choose_mime(declared, mime_hint, &bytes), bytes));
+    }
+    let bytes = decode_base64(data)?;
+    Ok((choose_mime("", mime_hint, &bytes), bytes))
+}
+
+fn choose_mime(declared: &str, hint: &str, bytes: &[u8]) -> String {
+    let declared = declared.trim();
+    if is_visual_mime(declared) {
+        return declared.to_ascii_lowercase();
+    }
+    let hint = hint.trim();
+    if is_visual_mime(hint) {
+        return hint.to_ascii_lowercase();
+    }
+    sniff_mime(bytes)
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn is_visual_mime(mime: &str) -> bool {
+    let mime = mime.trim().to_ascii_lowercase();
+    mime.starts_with("image/") || mime.starts_with("video/")
+}
+
+fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("video/mp4")
+    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("video/webm")
+    } else {
+        None
+    }
+}
+
+fn decode_base64(payload: &str) -> Result<Vec<u8>> {
+    let compact: String = payload
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .collect();
+    STANDARD
+        .decode(compact.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(compact.as_bytes()))
+        .map_err(|_| Error::Protocol("attached media is not valid base64".into()))
+}
+
+async fn fetch_remote_media(url: &str, mime_hint: &str) -> Result<ContentPart> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .build()
+        .map_err(|error| Error::Protocol(format!("attached media client: {error}")))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| Error::Protocol("attached media could not be downloaded".into()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Protocol(format!(
+            "attached media download returned {status}"
+        )));
+    }
+    let header_mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| Error::Protocol("attached media download ended early".into()))?;
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return Err(Error::Protocol(
+            "attached media exceeds the size limit".into(),
+        ));
+    }
+    let mime = choose_mime(&header_mime, mime_hint, &bytes);
+    if !is_visual_mime(&mime) {
+        return Err(Error::Protocol(format!(
+            "attached media type {mime} is not an image or video"
+        )));
+    }
+    Ok(ContentPart::Image {
+        mime_type: mime,
+        data: bytes.to_vec(),
+    })
 }
 
 fn value_text(bytes: &[u8]) -> String {
@@ -307,7 +533,7 @@ async fn start_invocation(
     if let Some(heartbeats) = heartbeats {
         spawn_heartbeats(handle.clone(), heartbeats);
     }
-    let mut projected = project_prompt(&request, &routing_text)?;
+    let mut projected = project_prompt(&request, &routing_text).await?;
     if projected.model.model_id.is_empty() {
         projected.model.model_id = model_id;
     }

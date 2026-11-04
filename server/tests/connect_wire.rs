@@ -262,8 +262,8 @@ fn existing_conversation_state_stays_on_the_agent_path() {
     );
 }
 
-#[test]
-fn inference_prompt_keeps_user_text_and_tool_result() {
+#[tokio::test]
+async fn inference_prompt_keeps_user_text_and_tool_result() {
     let request = inf::InferenceStreamRequest {
         messages: vec![
             core_text(4, "stay brief"),
@@ -285,13 +285,69 @@ fn inference_prompt_keeps_user_text_and_tool_result() {
         model_id: "model-alpha".into(),
         ..Default::default()
     };
-    let projected = cursor::inference::project_prompt(&request, "fallback").unwrap();
+    let projected = cursor::inference::project_prompt(&request, "fallback")
+        .await
+        .unwrap();
     assert_eq!(projected.prompt.instructions, "stay brief");
     assert_eq!(projected.model.model_id, "model-alpha");
     assert_eq!(projected.history.len(), 2);
     assert!(history_text(&projected.history[0]).contains("status-check"));
     assert!(history_text(&projected.history[1]).contains("tool-out"));
     assert!(!history_text(&projected.history[1]).contains("fallback"));
+}
+
+#[tokio::test]
+async fn inference_prompt_passes_image_and_video_bytes() {
+    use base64::engine::general_purpose::STANDARD;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+    let video: &[u8] = b"\0\0\0\x18ftypisom";
+    let request = inf::InferenceStreamRequest {
+        messages: vec![inf::InferenceCoreMessage {
+            role: 1,
+            content: Some(inf::inference_core_message::Content::Parts(
+                inf::InferenceContentParts {
+                    parts: vec![
+                        image_part(&format!("data:image/png;base64,{}", STANDARD.encode(png))),
+                        image_part(&format!("data:video/mp4;base64,{}", STANDARD.encode(video))),
+                        inf::InferenceContentPart {
+                            part: Some(inf::inference_content_part::Part::File(
+                                inf::InferenceFilePart {
+                                    data: STANDARD.encode(video),
+                                    media_type: "video/mp4".into(),
+                                    filename: "clip.mp4".into(),
+                                },
+                            )),
+                        },
+                    ],
+                },
+            )),
+        }],
+        model_id: "model-alpha".into(),
+        ..Default::default()
+    };
+    let projected = cursor::inference::project_prompt(&request, "")
+        .await
+        .unwrap();
+    let cursor_server::model::ProjectedContent::Parts(parts) = &projected.history[0].content else {
+        panic!("expected image and video parts");
+    };
+    assert_eq!(
+        parts.as_slice(),
+        [
+            cursor_server::model::ContentPart::Image {
+                mime_type: "image/png".into(),
+                data: png.to_vec(),
+            },
+            cursor_server::model::ContentPart::Image {
+                mime_type: "video/mp4".into(),
+                data: video.to_vec(),
+            },
+            cursor_server::model::ContentPart::Image {
+                mime_type: "video/mp4".into(),
+                data: video.to_vec(),
+            },
+        ]
+    );
 }
 
 #[test]
@@ -387,6 +443,17 @@ fn inference_text(
                 },
             ),
         ),
+    }
+}
+
+fn image_part(data: &str) -> inf::InferenceContentPart {
+    inf::InferenceContentPart {
+        part: Some(inf::inference_content_part::Part::Image(
+            inf::InferenceImagePart {
+                data: data.into(),
+                mime_type: String::new(),
+            },
+        )),
     }
 }
 
