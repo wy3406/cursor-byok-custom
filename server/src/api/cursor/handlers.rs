@@ -51,6 +51,10 @@ fn router_with_proxy(
             "/aiserver.v1.InferenceService/RunInferenceSSE",
             post(run_sse_handler),
         )
+        .route(
+            "/aiserver.v1.InferenceService/RunInference",
+            post(super::run_bidi::handler),
+        )
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_handler))
         .route(
             "/aiserver.v1.AiService/AvailableDocs",

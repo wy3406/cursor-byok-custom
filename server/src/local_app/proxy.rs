@@ -159,6 +159,7 @@ fn is_local_path(path: &str) -> bool {
         path,
         "/agent.v1.AgentService/RunSSE"
             | "/aiserver.v1.InferenceService/RunInferenceSSE"
+            | "/aiserver.v1.InferenceService/RunInference"
             | "/aiserver.v1.BidiService/BidiAppend"
             | "/aiserver.v1.AiService/AvailableDocs"
             | "/aiserver.v1.DashboardService/GetEffectiveUserPlugins"
@@ -204,6 +205,7 @@ mod tests {
     fn cursor_cli_transport_and_model_metadata_routes_stay_local() {
         for path in [
             "/aiserver.v1.InferenceService/RunInferenceSSE",
+            "/aiserver.v1.InferenceService/RunInference",
             "/aiserver.v1.AiService/GetServerConfig",
             "/aiserver.v1.ServerConfigService/GetServerConfig",
             "/agent.v1.AgentService/GetDefaultModelForCli",
