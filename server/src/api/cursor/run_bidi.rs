@@ -38,7 +38,7 @@ pub async fn handler(
     let parent = parent_headers(&parts.headers)?;
     tracing::info!(request_id, "accepted inference bidi stream");
     let handle = registry.get_or_create(&request_id).await?;
-    let receiver = handle.subscribe();
+    let mut receiver = handle.subscribe();
     let reader_handle = handle.clone();
     let reader = registry.clone();
     let reader_id = request_id;
