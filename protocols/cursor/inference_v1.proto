@@ -12,6 +12,10 @@ message RunInferenceClientMessage {
     RunInferenceCancelInvocation cancel_invocation = 3;
     RunInferenceFinishRun finish_run = 4;
     RunInferenceClientHeartbeat client_heartbeat = 5;
+    RunInferenceAgentEvent agent_event = 6;
+    RunInferenceRunRequestLog run_request_log = 7;
+    RunInferenceResolveSubagentModels resolve_subagent_models = 9;
+    RunInferenceClientFirstCallTimings client_first_call_timings = 10;
   }
 }
 
@@ -60,8 +64,30 @@ message RunInferenceFinishRun {
 
 message RunInferenceClientHeartbeat {}
 
+message RunInferenceAgentEvent {}
+
+message RunInferenceRunRequestLog {}
+
+message RunInferenceResolveSubagentModels {}
+
+message RunInferenceClientFirstCallTimings {}
+
+message InferenceAgentTool {
+  string name = 1;
+  string description = 2;
+  bytes parameters = 3;
+}
+
+message InferenceToolCall {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bytes args = 3;
+  string raw_tool_call_args = 4;
+}
+
 message InferenceStreamRequest {
   repeated InferenceCoreMessage messages = 1;
+  repeated InferenceAgentTool tools = 2;
   string model_id = 5;
   InferenceRequestedModel requested_model = 7;
   string conversation_id = 8;
@@ -74,6 +100,7 @@ message InferenceCoreMessage {
     InferenceContentParts parts = 3;
     InferenceToolResultContent tool_content = 6;
   }
+  repeated InferenceToolCall tool_calls = 4;
 }
 
 message InferenceContentParts {
@@ -129,8 +156,43 @@ message RunInferenceHeartbeat {
   bool accepts_speculative_invocations = 1;
 }
 
+message RunInferencePromptModelMetadata {
+  string vendor = 1;
+  string prompt_version = 2;
+  bool is_sonnet45 = 3;
+  bool is_gemini3 = 4;
+  bool is_gpt51 = 5;
+  bool is_gpt52 = 6;
+  bool is_gpt5 = 7;
+  bool is_gpt55 = 8;
+  bool is_gpt56 = 9;
+  bool is_sonnet4 = 10;
+  bool is_codex_family = 11;
+  bool is_gpt54 = 12;
+  bool is_gpt52_codex = 13;
+  bool is_gpt53_codex = 14;
+  bool is_gpt53_codex_spark = 15;
+  bool is_claude_4x = 16;
+  bool is_opus45 = 17;
+  bool is_opus46 = 18;
+  bool is_opus48 = 19;
+  bool is_opus5 = 20;
+  bool is_fable5 = 21;
+  bool is_gpt5_family = 23;
+  bool is_composer1 = 24;
+  bool is_composer15 = 25;
+  bool is_composer2 = 26;
+  bool is_composer_matterhorn = 27;
+  bool is_grok45_product_prompt = 28;
+  bool is_grok46_product_prompt = 34;
+  bool is_fable51 = 43;
+  string self_identity_name = 44;
+  bool is_opus55 = 50;
+}
+
 message RunInferenceRunReady {
   InferenceRequestedModel resolved_model = 1;
+  RunInferencePromptModelMetadata prompt_model_metadata = 4;
   bool accepts_client_heartbeat = 7;
 }
 
@@ -139,9 +201,18 @@ message RunInferenceInvocationResponse {
   InferenceStreamResponse response = 2;
 }
 
+message InferenceToolCallStreamPart {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string args = 3;
+  bool is_complete = 4;
+  int32 tool_index = 5;
+}
+
 message InferenceStreamResponse {
   oneof response {
     InferenceTextStreamPart text_part = 1;
+    InferenceToolCallStreamPart tool_call_part = 2;
     InferenceThinkingStreamPart thinking_part = 9;
   }
 }

@@ -199,7 +199,7 @@ pub fn decode_client(request: &ai::BidiAppendRequest) -> Result<ClientAppend> {
     let request_id = required_request_id(request)?;
     let payload = agent_payload(request)?;
     if let Ok(message) = agent::AgentClientMessage::decode(payload.as_slice()) {
-        if message.message.is_some() {
+        if agent_owns_append(&message) {
             return Ok(ClientAppend::Agent(DecodedAppend {
                 request_id,
                 seqno: request.append_seqno,
@@ -234,7 +234,12 @@ fn inference_arm_plausible(message: &inf::run_inference_client_message::Message)
         Message::RunRequest(request) => looks_like_uuid(&request.conversation_id),
         Message::InvokeModel(invoke) => !invoke.invocation_id.is_empty(),
         Message::CancelInvocation(cancel) => !cancel.invocation_id.is_empty(),
-        Message::FinishRun(_) | Message::ClientHeartbeat(_) => true,
+        Message::FinishRun(_)
+        | Message::ClientHeartbeat(_)
+        | Message::AgentEvent(_)
+        | Message::RunRequestLog(_)
+        | Message::ResolveSubagentModels(_)
+        | Message::ClientFirstCallTimings(_) => true,
     }
 }
 
@@ -321,6 +326,22 @@ fn inference_trace(append: &InferenceAppend) -> serde_json::Value {
             "append_seqno": append.seqno,
             "message_type": "inference_client_heartbeat",
         }),
+        Message::AgentEvent(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_agent_event",
+        }),
+        Message::RunRequestLog(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_run_request_log",
+        }),
+        Message::ResolveSubagentModels(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_resolve_subagent_models",
+        }),
+        Message::ClientFirstCallTimings(_) => serde_json::json!({
+            "append_seqno": append.seqno,
+            "message_type": "inference_client_first_call_timings",
+        }),
     }
 }
 
@@ -333,11 +354,29 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
             wire_outline(&payload)
         ))
     })?;
+    if bare_interaction_response(&message) {
+        return Err(Error::Protocol(format!(
+            "protobuf decode error: AgentClientMessage.message field 6 has no interaction id; {}",
+            wire_outline(&payload)
+        )));
+    }
     Ok(DecodedAppend {
         request_id,
         seqno: request.append_seqno,
         message,
     })
+}
+
+fn agent_owns_append(message: &agent::AgentClientMessage) -> bool {
+    !bare_interaction_response(message) && message.message.is_some()
+}
+
+fn bare_interaction_response(message: &agent::AgentClientMessage) -> bool {
+    matches!(
+        &message.message,
+        Some(agent::agent_client_message::Message::InteractionResponse(response))
+            if response.id == 0 && response.result.is_none()
+    )
 }
 
 fn agent_payload(request: &ai::BidiAppendRequest) -> Result<Vec<u8>> {

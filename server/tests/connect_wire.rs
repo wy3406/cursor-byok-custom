@@ -262,6 +262,38 @@ fn existing_conversation_state_stays_on_the_agent_path() {
     );
 }
 
+#[test]
+fn inference_agent_event_decodes_as_inference_append() {
+    let payload = inf::RunInferenceClientMessage {
+        message: Some(inf::run_inference_client_message::Message::AgentEvent(
+            inf::RunInferenceAgentEvent {},
+        )),
+    }
+    .encode_to_vec();
+    let decoded = must_decode_client(append_request(payload.clone(), false));
+    let cursor::bidi::ClientAppend::Inference(_) = decoded else {
+        panic!("expected an inference agent event");
+    };
+    assert!(cursor::bidi::decode(&append_request(payload, false)).is_err());
+}
+
+#[test]
+fn inference_agent_event_string_fields_decode_as_inference() {
+    let method_name = b"method-name-xxxxx";
+    assert_eq!(method_name.len(), 17);
+    let mut inner = length_delimited(1, method_name);
+    inner.extend(length_delimited(2, b"options"));
+    inner.extend(proto_key(3, 0));
+    inner.extend(proto_varint(1));
+    let payload = length_delimited(6, &inner);
+    assert!(pb::AgentClientMessage::decode(payload.as_slice()).is_err());
+    assert!(cursor::bidi::decode(&append_request(payload.clone(), false)).is_err());
+    let decoded = must_decode_client(append_request(payload, false));
+    let cursor::bidi::ClientAppend::Inference(_) = decoded else {
+        panic!("expected an inference agent event");
+    };
+}
+
 #[tokio::test]
 async fn inference_prompt_keeps_user_text_and_tool_result() {
     let request = inf::InferenceStreamRequest {
@@ -280,9 +312,15 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
                         }],
                     },
                 )),
+                ..Default::default()
             },
         ],
         model_id: "model-alpha".into(),
+        tools: vec![inf::InferenceAgentTool {
+            name: "lookup".into(),
+            parameters: br#"{"type":"object"}"#.to_vec(),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     let projected = cursor::inference::project_prompt(&request, "fallback")
@@ -290,10 +328,59 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
         .unwrap();
     assert_eq!(projected.prompt.instructions, "stay brief");
     assert_eq!(projected.model.model_id, "model-alpha");
+    assert_eq!(projected.prompt.tools.len(), 1);
+    assert_eq!(projected.prompt.tools[0].name, "lookup");
+    assert_eq!(
+        projected.prompt.tools[0]
+            .parameters
+            .get("type")
+            .and_then(|value| value.as_str()),
+        Some("object")
+    );
     assert_eq!(projected.history.len(), 2);
+    assert!(matches!(
+        projected.history[1].role,
+        cursor_server::model::Role::Tool
+    ));
     assert!(history_text(&projected.history[0]).contains("status-check"));
     assert!(history_text(&projected.history[1]).contains("tool-out"));
     assert!(!history_text(&projected.history[1]).contains("fallback"));
+}
+
+#[tokio::test]
+async fn inference_prompt_keeps_assistant_tool_call() {
+    let request = inf::InferenceStreamRequest {
+        messages: vec![inf::InferenceCoreMessage {
+            role: 2,
+            content: Some(inf::inference_core_message::Content::Text(
+                "checking".into(),
+            )),
+            tool_calls: vec![inf::InferenceToolCall {
+                tool_call_id: "call-9".into(),
+                tool_name: "lookup".into(),
+                raw_tool_call_args: r#"{"q":1}"#.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let projected = cursor::inference::project_prompt(&request, "")
+        .await
+        .unwrap();
+    let message = &projected.history[0];
+    let cursor_server::model::ProjectedContent::Assistant { text, calls, .. } = &message.content
+    else {
+        panic!("expected an assistant tool call");
+    };
+    assert!(text.contains("checking"));
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "lookup");
+    assert_eq!(calls[0].call_id, "call-9");
+    assert_eq!(
+        calls[0].arguments.get("q").and_then(|value| value.as_i64()),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -321,6 +408,7 @@ async fn inference_prompt_passes_image_and_video_bytes() {
                     ],
                 },
             )),
+            ..Default::default()
         }],
         model_id: "model-alpha".into(),
         ..Default::default()
@@ -359,12 +447,26 @@ fn inference_server_frames_use_the_local_loop_field_numbers() {
                     model_id: "model-alpha".into(),
                     ..Default::default()
                 }),
+                prompt_model_metadata: Some(inf::RunInferencePromptModelMetadata {
+                    vendor: "openai".into(),
+                    prompt_version: "latest".into(),
+                    ..Default::default()
+                }),
                 accepts_client_heartbeat: true,
             },
         )),
     };
     let ready_bytes = ready.encode_to_vec();
     assert_eq!(ready_bytes[0], 0x12, "run_ready is field 2");
+    let decoded_ready = inf::RunInferenceServerMessage::decode(ready_bytes.as_slice()).unwrap();
+    let inf::run_inference_server_message::Message::RunReady(ready_message) =
+        decoded_ready.message.unwrap()
+    else {
+        panic!("expected run_ready");
+    };
+    let metadata = ready_message.prompt_model_metadata.unwrap();
+    assert_eq!(metadata.vendor, "openai");
+    assert_eq!(metadata.prompt_version, "latest");
 
     let text = inference_text("invoke-1", "ping", false);
     let text_bytes = text.encode_to_vec();
@@ -398,6 +500,90 @@ fn inference_server_frames_use_the_local_loop_field_numbers() {
     };
     assert!(part.is_final);
     assert!(part.text.is_empty());
+}
+
+#[test]
+fn local_prompt_metadata_uses_cursor_vendor_names() {
+    use cursor_server::model::ModelType;
+
+    let gpt6 = cursor::inference::local_prompt_metadata(
+        Some(ModelType::OpenAi),
+        "gpt-6.1-sol",
+        "gpt-6.1-sol",
+    );
+    assert_eq!(gpt6.vendor, "openai");
+    assert_eq!(gpt6.prompt_version, "latest");
+    assert!(gpt6.is_gpt56);
+    assert!(gpt6.is_gpt5_family);
+    assert!(!gpt6.is_gemini3);
+    assert!(!gpt6.is_opus55);
+    assert_eq!(gpt6.self_identity_name, "gpt-6.1-sol");
+
+    let gemini = cursor::inference::local_prompt_metadata(
+        Some(ModelType::OpenAi),
+        "gemini-4-argon",
+        "gemini-4-argon",
+    );
+    assert_eq!(gemini.vendor, "google");
+    assert!(gemini.is_gemini3);
+    assert_eq!(gemini.prompt_version, "latest");
+    assert!(!gemini.is_gpt56);
+    assert_eq!(gemini.self_identity_name, "gemini-4-argon");
+
+    let opus = cursor::inference::local_prompt_metadata(
+        Some(ModelType::OpenAi),
+        "claude-opus-5-5",
+        "claude-opus-5-5",
+    );
+    assert_eq!(opus.vendor, "anthropic");
+    assert!(opus.is_opus55);
+    assert!(opus.is_claude_4x);
+    assert_eq!(opus.prompt_version, "latest");
+    assert!(!opus.is_gpt5_family);
+    assert_eq!(opus.self_identity_name, "claude-opus-5-5");
+
+    let grok = cursor::inference::local_prompt_metadata(None, "grok-4.7", "grok-4.7");
+    assert_eq!(grok.vendor, "xai");
+    assert!(grok.is_grok46_product_prompt);
+    assert_eq!(grok.prompt_version, "latest");
+    assert_eq!(grok.self_identity_name, "grok-4.7");
+
+    let haiku = cursor::inference::local_prompt_metadata(
+        Some(ModelType::Anthropic),
+        "",
+        "claude-haiku-4-5",
+    );
+    assert_eq!(haiku.vendor, "anthropic");
+    assert_eq!(haiku.prompt_version, "haiku");
+    assert!(haiku.is_claude_4x);
+    assert_eq!(haiku.self_identity_name, "claude-haiku-4-5");
+
+    let composer = cursor::inference::local_prompt_metadata(None, "composer-2", "composer-2");
+    assert_eq!(composer.vendor, "cursor");
+    assert!(composer.is_composer2);
+    assert_eq!(composer.prompt_version, "latest");
+    assert_eq!(composer.self_identity_name, "composer-2");
+
+    let empty_openai = cursor::inference::local_prompt_metadata(Some(ModelType::OpenAi), "", "");
+    assert_eq!(empty_openai.vendor, "openai");
+    assert_eq!(empty_openai.prompt_version, "latest");
+    assert!(empty_openai.self_identity_name.is_empty());
+    assert!(!empty_openai.is_gpt5_family);
+
+    let custom = cursor::inference::local_prompt_metadata(
+        Some(ModelType::Anthropic),
+        "my-model",
+        "my-model",
+    );
+    assert_eq!(custom.vendor, "anthropic");
+    assert_eq!(custom.prompt_version, "latest");
+    assert!(!custom.is_claude_4x);
+    assert_eq!(custom.self_identity_name, "my-model");
+
+    let unknown = cursor::inference::local_prompt_metadata(None, "", "");
+    assert_eq!(unknown.vendor, "unknown");
+    assert_eq!(unknown.prompt_version, "latest");
+    assert!(unknown.self_identity_name.is_empty());
 }
 
 fn inference_run(
@@ -461,6 +647,7 @@ fn core_text(role: i32, text: &str) -> inf::InferenceCoreMessage {
     inf::InferenceCoreMessage {
         role,
         content: Some(inf::inference_core_message::Content::Text(text.into())),
+        ..Default::default()
     }
 }
 
@@ -476,6 +663,7 @@ fn core_parts(role: i32, text: &str) -> inf::InferenceCoreMessage {
                 }],
             },
         )),
+        ..Default::default()
     }
 }
 

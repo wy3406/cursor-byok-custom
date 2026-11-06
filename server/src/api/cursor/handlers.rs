@@ -240,7 +240,30 @@ async fn bidi_handler(
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
-    let decoded = bidi::decode_client(&request)?;
+    let decoded = match bidi::decode_client(&request) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            let request_id = request
+                .request_id
+                .as_ref()
+                .map(|id| id.request_id.as_str())
+                .filter(|id| !id.is_empty());
+            if let Some(request_id) = request_id {
+                if registry.upstream(request_id).await {
+                    tracing::info!(
+                        request_id,
+                        "forwarding undecoded BidiAppend to Cursor upstream"
+                    );
+                    return proxy::forward(
+                        Extension(proxy),
+                        Request::from_parts(parts, Body::from(body)),
+                    )
+                    .await;
+                }
+            }
+            return Err(error);
+        }
+    };
     let first_model = decoded.model_id().map(str::to_owned);
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();

@@ -5,7 +5,12 @@
 //! Replies on the open RunInferenceSSE stream are RunInferenceServerMessage
 //! frames: run_ready, then invocation text, then invocation_end.
 
-use std::{collections::HashMap, io::Read, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Read,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use flate2::read::GzDecoder;
@@ -21,20 +26,22 @@ use crate::{
             connect,
             proto::inference::v1::{
                 inference_content_part, inference_core_message, inference_stream_response,
-                run_inference_client_message, run_inference_server_message, InferenceContentPart,
-                InferenceCoreMessage, InferenceStreamRequest, InferenceStreamResponse,
-                InferenceTextStreamPart, InferenceThinkingStreamPart,
+                run_inference_client_message, run_inference_server_message, InferenceAgentTool,
+                InferenceContentPart, InferenceCoreMessage, InferenceStreamRequest,
+                InferenceStreamResponse, InferenceTextStreamPart, InferenceThinkingStreamPart,
+                InferenceToolCall, InferenceToolCallStreamPart, InferenceToolResultContent,
                 RunInferenceCompressedRequest, RunInferenceHeartbeat, RunInferenceInvocationEnd,
                 RunInferenceInvocationError, RunInferenceInvocationResponse,
-                RunInferenceInvokeModel, RunInferenceRoutingMessage, RunInferenceRunReady,
-                RunInferenceRunRequest, RunInferenceServerMessage,
+                RunInferenceInvokeModel, RunInferencePromptModelMetadata,
+                RunInferenceRoutingMessage, RunInferenceRunReady, RunInferenceRunRequest,
+                RunInferenceServerMessage,
             },
         },
         transport::{TransportHandle, TransportParent, TransportRegistry},
     },
     model::{
-        ContentPart, ModelInvocation, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
-        PromptSpec, Role,
+        ContentPart, ModelInvocation, ModelRequest, ModelSpec, ModelType, ProjectedContent,
+        ProjectedMessage, PromptSpec, Role, ToolCallContent, ToolDefinition, ToolResultContent,
     },
     provider::ModelEvent,
     Error, Result,
@@ -97,7 +104,7 @@ pub async fn accept(
     );
     match message {
         run_inference_client_message::Message::RunRequest(request) => {
-            open_run(&handle, request).await
+            open_run(registry, &handle, request).await
         }
         run_inference_client_message::Message::InvokeModel(invoke) => {
             start_invocation(registry, &handle, invoke).await
@@ -111,6 +118,10 @@ pub async fn accept(
             finish_session(request_id).await;
             Ok(())
         }
+        run_inference_client_message::Message::AgentEvent(_)
+        | run_inference_client_message::Message::RunRequestLog(_)
+        | run_inference_client_message::Message::ResolveSubagentModels(_)
+        | run_inference_client_message::Message::ClientFirstCallTimings(_) => Ok(()),
     }
 }
 
@@ -121,6 +132,15 @@ pub async fn project_prompt(
     let mut instructions = String::new();
     let mut history = Vec::new();
     for (index, message) in request.messages.iter().enumerate() {
+        if let Some(inference_core_message::Content::ToolContent(content)) = &message.content {
+            push_tool_results(&mut history, index, content);
+            continue;
+        }
+        if message.role == ROLE_ASSISTANT && !message.tool_calls.is_empty() {
+            let parts = message_parts(message).await?;
+            history.push(assistant_with_calls(index, &parts, &message.tool_calls));
+            continue;
+        }
         let parts = message_parts(message).await?;
         if parts.is_empty() {
             continue;
@@ -166,11 +186,116 @@ pub async fn project_prompt(
     Ok(ModelRequest {
         prompt: PromptSpec {
             instructions,
-            tools: Vec::new(),
+            tools: project_tools(&request.tools),
         },
         model: ModelSpec::new(model_id),
         history,
     })
+}
+
+fn project_tools(tools: &[InferenceAgentTool]) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .filter(|tool| !tool.name.is_empty())
+        .map(|tool| ToolDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: parameters_value(&tool.parameters),
+        })
+        .collect()
+}
+
+fn push_tool_results(
+    history: &mut Vec<ProjectedMessage>,
+    index: usize,
+    content: &InferenceToolResultContent,
+) {
+    for (part_index, part) in content.parts.iter().enumerate() {
+        history.push(ProjectedMessage {
+            message_id: format!("inference-{index}-{part_index}"),
+            role: Role::Tool,
+            content: ProjectedContent::ToolResult(ToolResultContent {
+                call_id: part.tool_call_id.clone(),
+                name: part.tool_name.clone(),
+                content: value_text(&part.result),
+                is_error: part.is_error,
+                image: None,
+                provider_parts: Vec::new(),
+            }),
+        });
+    }
+}
+
+fn assistant_with_calls(
+    index: usize,
+    parts: &[ContentPart],
+    tool_calls: &[InferenceToolCall],
+) -> ProjectedMessage {
+    ProjectedMessage {
+        message_id: format!("inference-{index}"),
+        role: Role::Assistant,
+        content: ProjectedContent::Assistant {
+            text: join_text(parts),
+            thinking: String::new(),
+            replay_state: None,
+            calls: tool_calls
+                .iter()
+                .enumerate()
+                .map(|(call_index, call)| ToolCallContent {
+                    index: call_index,
+                    call_id: call.tool_call_id.clone(),
+                    name: call.tool_name.clone(),
+                    arguments: tool_call_arguments(call),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn tool_call_arguments(call: &InferenceToolCall) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_str(&call.raw_tool_call_args) {
+        return value;
+    }
+    parameters_value(&call.args)
+}
+
+fn parameters_value(bytes: &[u8]) -> serde_json::Value {
+    if bytes.is_empty() {
+        return serde_json::json!({});
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        if value.is_object() {
+            return value;
+        }
+    }
+    prost_types::Struct::decode(bytes)
+        .map(|value| struct_json(&value))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn struct_json(value: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), prost_json(value)))
+            .collect(),
+    )
+}
+
+fn prost_json(value: &prost_types::Value) -> serde_json::Value {
+    match value.kind.as_ref() {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(number)) => serde_json::Number::from_f64(*number)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::StringValue(text)) => serde_json::Value::String(text.clone()),
+        Some(Kind::BoolValue(flag)) => serde_json::Value::Bool(*flag),
+        Some(Kind::StructValue(nested)) => struct_json(nested),
+        Some(Kind::ListValue(values)) => {
+            serde_json::Value::Array(values.values.iter().map(prost_json).collect())
+        }
+    }
 }
 
 fn push_system(
@@ -480,7 +605,153 @@ fn kind_text(kind: Option<&Kind>, depth: usize) -> String {
     }
 }
 
-async fn open_run(handle: &TransportHandle, request: RunInferenceRunRequest) -> Result<()> {
+pub fn local_prompt_metadata(
+    model_type: Option<ModelType>,
+    display_name: &str,
+    provider_model_id: &str,
+) -> RunInferencePromptModelMetadata {
+    let name = format!("{display_name} {provider_model_id}").to_ascii_lowercase();
+    let mut metadata = RunInferencePromptModelMetadata {
+        prompt_version: "latest".to_owned(),
+        self_identity_name: prompt_self_identity(display_name, provider_model_id),
+        ..Default::default()
+    };
+
+    if name.contains("gemini") {
+        metadata.vendor = "google".to_owned();
+        metadata.is_gemini3 = true;
+    } else if name.contains("grok") {
+        metadata.vendor = "xai".to_owned();
+        if contains_any(&name, &["4.7", "4-7", "4.6", "4-6"]) {
+            metadata.is_grok46_product_prompt = true;
+        } else if contains_any(&name, &["4.5", "4-5"]) {
+            metadata.is_grok45_product_prompt = true;
+        } else {
+            metadata.is_grok46_product_prompt = true;
+        }
+    } else if name.contains("haiku") {
+        metadata.vendor = "anthropic".to_owned();
+        metadata.prompt_version = "haiku".to_owned();
+        metadata.is_claude_4x = true;
+    } else if name.contains("fable") {
+        metadata.vendor = "anthropic".to_owned();
+        metadata.is_claude_4x = true;
+        if contains_any(&name, &["5.1", "5-1"]) {
+            metadata.is_fable51 = true;
+        } else {
+            metadata.is_fable5 = true;
+        }
+    } else if name.contains("opus") {
+        metadata.vendor = "anthropic".to_owned();
+        metadata.is_claude_4x = true;
+        if contains_any(&name, &["5.5", "5-5"]) {
+            metadata.is_opus55 = true;
+        } else if contains_any(&name, &["4.8", "4-8"]) {
+            metadata.is_opus48 = true;
+        } else if contains_any(&name, &["4.6", "4-6"]) {
+            metadata.is_opus46 = true;
+        } else if contains_any(&name, &["4.5", "4-5"]) {
+            metadata.is_opus45 = true;
+        } else {
+            metadata.is_opus5 = true;
+        }
+    } else if name.contains("sonnet") {
+        metadata.vendor = "anthropic".to_owned();
+        metadata.is_claude_4x = true;
+        if contains_any(&name, &["4.5", "4-5"]) {
+            metadata.is_sonnet45 = true;
+        } else {
+            metadata.is_sonnet4 = true;
+        }
+    } else if name.contains("claude") {
+        metadata.vendor = "anthropic".to_owned();
+        metadata.is_claude_4x = true;
+    } else if name.contains("matterhorn") {
+        metadata.vendor = "cursor".to_owned();
+        metadata.is_composer_matterhorn = true;
+        metadata.is_composer2 = true;
+    } else if name.contains("composer") {
+        metadata.vendor = "cursor".to_owned();
+        if contains_any(&name, &["1.5", "1-5"]) {
+            metadata.is_composer15 = true;
+        } else if contains_any(&name, &["composer-2", "composer2", "composer 2"]) {
+            metadata.is_composer2 = true;
+        } else {
+            metadata.is_composer1 = true;
+        }
+    } else if name.contains("glm") || name.contains("zai") {
+        metadata.vendor = "zai".to_owned();
+    } else if name.contains("codex") {
+        metadata.vendor = "openai".to_owned();
+        metadata.prompt_version = "gpt5-codex".to_owned();
+        metadata.is_codex_family = true;
+        metadata.is_gpt5_family = true;
+        if name.contains("spark") {
+            metadata.is_gpt53_codex_spark = true;
+        } else if contains_any(&name, &["5.3", "5-3"]) {
+            metadata.is_gpt53_codex = true;
+        } else if contains_any(&name, &["5.2", "5-2"]) {
+            metadata.is_gpt52_codex = true;
+        }
+    } else if contains_any(&name, &["gpt-6", "gpt6", "gpt-5.6", "gpt-5-6", "gpt56"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt56 = true;
+        metadata.is_gpt5_family = true;
+    } else if contains_any(&name, &["gpt-5.5", "gpt-5-5"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt55 = true;
+        metadata.is_gpt5_family = true;
+    } else if contains_any(&name, &["gpt-5.4", "gpt-5-4"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt54 = true;
+        metadata.is_gpt5_family = true;
+    } else if contains_any(&name, &["gpt-5.2", "gpt-5-2"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt52 = true;
+        metadata.is_gpt5_family = true;
+    } else if contains_any(&name, &["gpt-5.1", "gpt-5-1"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt51 = true;
+        metadata.is_gpt5_family = true;
+    } else if contains_any(&name, &["gpt-5", "gpt5", "gpt"]) {
+        metadata.vendor = "openai".to_owned();
+        metadata.is_gpt5 = true;
+        metadata.is_gpt5_family = true;
+    } else {
+        metadata.vendor = match model_type {
+            Some(ModelType::OpenAi) => "openai",
+            Some(ModelType::Anthropic) => "anthropic",
+            None => "unknown",
+        }
+        .to_owned();
+    }
+
+    metadata
+}
+
+fn prompt_self_identity(display_name: &str, provider_model_id: &str) -> String {
+    if !display_name.is_empty() {
+        display_name.to_owned()
+    } else if !provider_model_id.is_empty() && !is_sixteen_hex(provider_model_id) {
+        provider_model_id.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn is_sixteen_hex(value: &str) -> bool {
+    value.len() == 16 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+async fn open_run(
+    registry: &TransportRegistry,
+    handle: &TransportHandle,
+    request: RunInferenceRunRequest,
+) -> Result<()> {
     let model = request.requested_model.clone().unwrap_or_default();
     let routing_text = routing_user_text(&request.routing_conversation);
     let mut table = sessions().lock().await;
@@ -493,11 +764,24 @@ async fn open_run(handle: &TransportHandle, request: RunInferenceRunRequest) -> 
     table.insert(handle.request_id().to_owned(), session);
     drop(table);
     let model_id = model.model_id.clone();
+    let metadata = if model_id.is_empty() {
+        local_prompt_metadata(None, "", "")
+    } else {
+        match registry.store().model(&model_id).await? {
+            Some(stored) => local_prompt_metadata(
+                Some(stored.model_type),
+                &stored.display_name,
+                &stored.model_id,
+            ),
+            None => local_prompt_metadata(None, "", &model_id),
+        }
+    };
     emit(
         handle,
         &server(run_inference_server_message::Message::RunReady(
             RunInferenceRunReady {
                 resolved_model: Some(model),
+                prompt_model_metadata: Some(metadata.clone()),
                 accepts_client_heartbeat: true,
             },
         )),
@@ -506,6 +790,8 @@ async fn open_run(handle: &TransportHandle, request: RunInferenceRunRequest) -> 
     tracing::info!(
         request_id = handle.request_id(),
         model_id,
+        prompt_vendor = metadata.vendor.as_str(),
+        prompt_version = metadata.prompt_version.as_str(),
         "inference run ready"
     );
     Ok(())
@@ -591,7 +877,8 @@ async fn stream_invocation(
 ) -> Result<()> {
     let mut stream = provider.stream(invocation, cancel.clone());
     let mut saw_text = false;
-    let mut tool_names = Vec::new();
+    let mut saw_tool = false;
+    let mut open_tools = BTreeMap::<usize, OpenToolCall>::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -610,10 +897,18 @@ async fn stream_invocation(
                     ModelEvent::ThinkingDelta(text) if !text.is_empty() => {
                         emit_thinking(handle, invocation_id, &text)?;
                     }
-                    ModelEvent::ToolCallStart { name, .. } => {
-                        if !name.is_empty() {
-                            tool_names.push(name);
-                        }
+                    ModelEvent::ToolCallStart { index, call_id, name } => {
+                        let call = open_tools.entry(index).or_default();
+                        call.call_id = call_id;
+                        call.name = name;
+                    }
+                    ModelEvent::ToolCallArgumentsDelta { index, delta } => {
+                        open_tools.entry(index).or_default().arguments.push_str(&delta);
+                    }
+                    ModelEvent::ToolCallEnd { index } => {
+                        let call = open_tools.remove(&index).unwrap_or_default();
+                        emit_tool_call(handle, invocation_id, index, &call)?;
+                        saw_tool = true;
                     }
                     ModelEvent::Done(_) => break,
                     _ => {}
@@ -621,24 +916,18 @@ async fn stream_invocation(
             }
         }
     }
-    if !tool_names.is_empty() {
-        emit_text(
-            handle,
-            invocation_id,
-            &format!(
-                "Tool calls are not executed on this local inference loop: {}.",
-                tool_names.join(", ")
-            ),
-            false,
-        )?;
-        saw_text = true;
+    for (index, call) in open_tools {
+        emit_tool_call(handle, invocation_id, index, &call)?;
+        saw_tool = true;
     }
-    if !saw_text {
+    if !saw_text && !saw_tool {
         return Err(Error::Provider(
             "inference provider returned no text".into(),
         ));
     }
-    emit_text(handle, invocation_id, "", true)?;
+    if saw_text {
+        emit_text(handle, invocation_id, "", true)?;
+    }
     emit_end(handle, invocation_id, None)
 }
 
@@ -744,7 +1033,13 @@ fn model_of(message: &run_inference_client_message::Message) -> Option<&str> {
                 .as_ref()
                 .map(|model| model.model_id.as_str())
         }
-        _ => None,
+        run_inference_client_message::Message::CancelInvocation(_)
+        | run_inference_client_message::Message::FinishRun(_)
+        | run_inference_client_message::Message::ClientHeartbeat(_)
+        | run_inference_client_message::Message::AgentEvent(_)
+        | run_inference_client_message::Message::RunRequestLog(_)
+        | run_inference_client_message::Message::ResolveSubagentModels(_)
+        | run_inference_client_message::Message::ClientFirstCallTimings(_) => None,
     };
     model_id.filter(|model| !model.is_empty())
 }
@@ -759,7 +1054,13 @@ fn conversation_of(message: &run_inference_client_message::Message) -> Option<&s
             .as_ref()
             .map(|request| request.conversation_id.as_str())
             .unwrap_or(""),
-        _ => "",
+        run_inference_client_message::Message::CancelInvocation(_)
+        | run_inference_client_message::Message::FinishRun(_)
+        | run_inference_client_message::Message::ClientHeartbeat(_)
+        | run_inference_client_message::Message::AgentEvent(_)
+        | run_inference_client_message::Message::RunRequestLog(_)
+        | run_inference_client_message::Message::ResolveSubagentModels(_)
+        | run_inference_client_message::Message::ClientFirstCallTimings(_) => "",
     };
     if conversation_id.is_empty() {
         None
@@ -775,6 +1076,14 @@ fn message_kind(message: &run_inference_client_message::Message) -> &'static str
         run_inference_client_message::Message::CancelInvocation(_) => "cancel_invocation",
         run_inference_client_message::Message::FinishRun(_) => "finish_run",
         run_inference_client_message::Message::ClientHeartbeat(_) => "client_heartbeat",
+        run_inference_client_message::Message::AgentEvent(_) => "agent_event",
+        run_inference_client_message::Message::RunRequestLog(_) => "run_request_log",
+        run_inference_client_message::Message::ResolveSubagentModels(_) => {
+            "resolve_subagent_models"
+        }
+        run_inference_client_message::Message::ClientFirstCallTimings(_) => {
+            "client_first_call_timings"
+        }
     }
 }
 
@@ -814,6 +1123,40 @@ fn emit_heartbeat(handle: &TransportHandle) -> Result<()> {
         &server(run_inference_server_message::Message::Heartbeat(
             RunInferenceHeartbeat {
                 accepts_speculative_invocations: false,
+            },
+        )),
+    )
+}
+
+#[derive(Default)]
+struct OpenToolCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+fn emit_tool_call(
+    handle: &TransportHandle,
+    invocation_id: &str,
+    index: usize,
+    call: &OpenToolCall,
+) -> Result<()> {
+    emit(
+        handle,
+        &server(run_inference_server_message::Message::InvocationResponse(
+            RunInferenceInvocationResponse {
+                invocation_id: invocation_id.to_owned(),
+                response: Some(InferenceStreamResponse {
+                    response: Some(inference_stream_response::Response::ToolCallPart(
+                        InferenceToolCallStreamPart {
+                            tool_call_id: call.call_id.clone(),
+                            tool_name: call.name.clone(),
+                            args: call.arguments.clone(),
+                            is_complete: true,
+                            tool_index: i32::try_from(index).unwrap_or(i32::MAX),
+                        },
+                    )),
+                }),
             },
         )),
     )
