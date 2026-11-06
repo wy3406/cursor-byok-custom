@@ -135,6 +135,20 @@ fn apply_body_allowlist(
     Ok(())
 }
 
+fn first_reported_u64(value: &serde_json::Value, pointers: &[&str]) -> Option<u64> {
+    let mut reported_zero = false;
+    for pointer in pointers {
+        let Some(count) = value.pointer(pointer).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if count > 0 {
+            return Some(count);
+        }
+        reported_zero = true;
+    }
+    reported_zero.then_some(0)
+}
+
 fn apply_openai_prompt_cache_key(body: &mut serde_json::Value, model_id: &str) -> Result<()> {
     if !model_id.to_ascii_lowercase().contains("gpt") {
         return Ok(());

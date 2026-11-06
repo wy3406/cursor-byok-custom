@@ -316,11 +316,20 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
             },
         ],
         model_id: "model-alpha".into(),
-        tools: vec![inf::InferenceAgentTool {
-            name: "lookup".into(),
-            parameters: br#"{"type":"object"}"#.to_vec(),
-            ..Default::default()
-        }],
+        tools: vec![
+            inf::InferenceAgentTool {
+                name: "lookup".into(),
+                parameters: br#"{"type":"object","properties":{"path":{"type":"string"}}}"#
+                    .to_vec(),
+                ..Default::default()
+            },
+            inf::InferenceAgentTool {
+                name: "Read".into(),
+                description: "Read a file.".into(),
+                parameters: Vec::new(),
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     };
     let projected = cursor::inference::project_prompt(&request, "fallback")
@@ -328,15 +337,19 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
         .unwrap();
     assert_eq!(projected.prompt.instructions, "stay brief");
     assert_eq!(projected.model.model_id, "model-alpha");
-    assert_eq!(projected.prompt.tools.len(), 1);
+    assert_eq!(projected.prompt.tools.len(), 2);
     assert_eq!(projected.prompt.tools[0].name, "lookup");
     assert_eq!(
         projected.prompt.tools[0]
             .parameters
-            .get("type")
+            .pointer("/properties/path/type")
             .and_then(|value| value.as_str()),
-        Some("object")
+        Some("string")
     );
+    assert!(projected.prompt.tools[1]
+        .parameters
+        .as_object()
+        .is_some_and(|object| object.is_empty()));
     assert_eq!(projected.history.len(), 2);
     assert!(matches!(
         projected.history[1].role,

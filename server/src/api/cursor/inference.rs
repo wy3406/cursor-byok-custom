@@ -263,14 +263,61 @@ fn parameters_value(bytes: &[u8]) -> serde_json::Value {
     if bytes.is_empty() {
         return serde_json::json!({});
     }
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        if value.is_object() {
+    if let Some(value) = json_object_bytes(bytes) {
+        return unwrap_embedded_schema(value);
+    }
+    if let Ok(message) = prost_types::Struct::decode(bytes) {
+        let value = unwrap_embedded_schema(struct_json(&message));
+        if json_schema_has_fields(&value)
+            || value.as_object().is_some_and(|object| !object.is_empty())
+        {
             return value;
         }
     }
-    prost_types::Struct::decode(bytes)
-        .map(|value| struct_json(&value))
-        .unwrap_or_else(|_| serde_json::json!({}))
+    if let Ok(message) = prost_types::Value::decode(bytes) {
+        if let Some(Kind::StringValue(text)) = message.kind.as_ref() {
+            if let Some(value) = json_object_bytes(text.as_bytes()) {
+                return unwrap_embedded_schema(value);
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn json_object_bytes(bytes: &[u8]) -> Option<serde_json::Value> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    match value {
+        serde_json::Value::Object(_) => Some(value),
+        serde_json::Value::String(text) => {
+            let nested = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+            nested.is_object().then_some(nested)
+        }
+        _ => None,
+    }
+}
+
+fn unwrap_embedded_schema(value: serde_json::Value) -> serde_json::Value {
+    if json_schema_has_fields(&value) {
+        return value;
+    }
+    let Some(object) = value.as_object() else {
+        return value;
+    };
+    for key in ["jsonSchema", "input_schema", "parameters", "schema"] {
+        if let Some(inner) = object.get(key).filter(|inner| inner.is_object()).cloned() {
+            return unwrap_embedded_schema(inner);
+        }
+    }
+    value
+}
+
+fn json_schema_has_fields(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["properties", "anyOf", "oneOf", "allOf", "items"]
+        .into_iter()
+        .any(|key| object.contains_key(key))
 }
 
 fn struct_json(value: &prost_types::Struct) -> serde_json::Value {
@@ -878,10 +925,13 @@ async fn stream_invocation(
     let mut stream = provider.stream(invocation, cancel.clone());
     let mut saw_text = false;
     let mut saw_tool = false;
+    let mut saw_thinking = false;
+    let mut thinking_closed = false;
     let mut open_tools = BTreeMap::<usize, OpenToolCall>::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
                 emit_end(handle, invocation_id, None)?;
                 return Ok(());
             }
@@ -895,7 +945,11 @@ async fn stream_invocation(
                         emit_text(handle, invocation_id, &text, false)?;
                     }
                     ModelEvent::ThinkingDelta(text) if !text.is_empty() => {
-                        emit_thinking(handle, invocation_id, &text)?;
+                        saw_thinking = true;
+                        emit_thinking(handle, invocation_id, &text, false)?;
+                    }
+                    ModelEvent::ThinkingEnd => {
+                        close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
                     }
                     ModelEvent::ToolCallStart { index, call_id, name } => {
                         let call = open_tools.entry(index).or_default();
@@ -920,7 +974,8 @@ async fn stream_invocation(
         emit_tool_call(handle, invocation_id, index, &call)?;
         saw_tool = true;
     }
-    if !saw_text && !saw_tool {
+    close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
+    if !saw_text && !saw_tool && !saw_thinking {
         return Err(Error::Provider(
             "inference provider returned no text".into(),
         ));
@@ -1186,7 +1241,25 @@ fn emit_text(
     )
 }
 
-fn emit_thinking(handle: &TransportHandle, invocation_id: &str, text: &str) -> Result<()> {
+fn close_thinking(
+    handle: &TransportHandle,
+    invocation_id: &str,
+    saw_thinking: bool,
+    thinking_closed: &mut bool,
+) -> Result<()> {
+    if saw_thinking && !*thinking_closed {
+        emit_thinking(handle, invocation_id, "", true)?;
+        *thinking_closed = true;
+    }
+    Ok(())
+}
+
+fn emit_thinking(
+    handle: &TransportHandle,
+    invocation_id: &str,
+    text: &str,
+    is_final: bool,
+) -> Result<()> {
     emit(
         handle,
         &server(run_inference_server_message::Message::InvocationResponse(
@@ -1196,7 +1269,7 @@ fn emit_thinking(handle: &TransportHandle, invocation_id: &str, text: &str) -> R
                     response: Some(inference_stream_response::Response::ThinkingPart(
                         InferenceThinkingStreamPart {
                             text: text.to_owned(),
-                            is_final: false,
+                            is_final,
                         },
                     )),
                 }),

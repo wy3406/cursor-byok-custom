@@ -426,10 +426,23 @@ pub(crate) fn openai_usage(value: &Value) -> Usage {
         context_input_tokens: input_tokens,
         output_tokens: value.get("completion_tokens").and_then(Value::as_u64),
         total_tokens: value.get("total_tokens").and_then(Value::as_u64),
-        cache_read_tokens: value
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64),
-        cache_write_tokens: None,
+        cache_read_tokens: super::first_reported_u64(
+            value,
+            &[
+                "/prompt_tokens_details/cached_tokens",
+                "/input_tokens_details/cached_tokens",
+            ],
+        ),
+        cache_write_tokens: super::first_reported_u64(
+            value,
+            &[
+                "/prompt_tokens_details/cache_write_tokens",
+                "/prompt_tokens_details/cache_creation_tokens",
+                "/input_tokens_details/cache_write_tokens",
+                "/cache_creation_input_tokens",
+                "/cache_write_tokens",
+            ],
+        ),
         reasoning_tokens: value
             .pointer("/completion_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64),

@@ -114,6 +114,8 @@ impl Provider for OpenAiResponsesProvider {
             let mut text_open = false;
             let mut text = String::new();
             let mut thinking_open = false;
+            let mut reasoning_delta_indexes = std::collections::BTreeSet::<usize>::new();
+            let mut unindexed_reasoning_delta = false;
             let mut tools = std::collections::BTreeMap::<usize, ResponseToolState>::new();
             let mut reasoning_items = Vec::new();
             let mut saw_tool = false;
@@ -149,7 +151,14 @@ impl Provider for OpenAiResponsesProvider {
                     }
                     "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                         if !thinking_open { thinking_open = true; yield ModelEvent::ThinkingStart; }
-                        if let Some(delta) = value.get("delta").and_then(Value::as_str) { yield ModelEvent::ThinkingDelta(delta.into()); }
+                        if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                            note_reasoning_delta(
+                                &value,
+                                &mut reasoning_delta_indexes,
+                                &mut unindexed_reasoning_delta,
+                            );
+                            yield ModelEvent::ThinkingDelta(delta.into());
+                        }
                     }
                     "response.reasoning_summary_text.done" | "response.reasoning_text.done"
                         if thinking_open => { thinking_open = false; yield ModelEvent::ThinkingEnd; }
@@ -165,7 +174,22 @@ impl Provider for OpenAiResponsesProvider {
                         let item = value.get("item").unwrap_or(&Value::Null);
                         match item.get("type").and_then(Value::as_str) {
                             Some("reasoning") => {
-                                if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
+                                let streamed = take_reasoning_item_streamed(
+                                    &value,
+                                    &mut reasoning_delta_indexes,
+                                    &mut unindexed_reasoning_delta,
+                                );
+                                if !thinking_open && !streamed {
+                                    let text = reasoning_visible_text(item);
+                                    if !text.is_empty() {
+                                        yield ModelEvent::ThinkingStart;
+                                        yield ModelEvent::ThinkingDelta(text);
+                                        yield ModelEvent::ThinkingEnd;
+                                    }
+                                } else if thinking_open {
+                                    thinking_open = false;
+                                    yield ModelEvent::ThinkingEnd;
+                                }
                                 reasoning_items.push(item.clone());
                             }
                             Some("message") => {
@@ -273,6 +297,118 @@ impl Provider for OpenAiResponsesProvider {
     }
 }
 
+fn note_reasoning_delta(
+    event: &Value,
+    indexes: &mut std::collections::BTreeSet<usize>,
+    unindexed: &mut bool,
+) {
+    if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+        indexes.insert(index as usize);
+    } else {
+        *unindexed = true;
+    }
+}
+
+fn take_reasoning_item_streamed(
+    event: &Value,
+    indexes: &mut std::collections::BTreeSet<usize>,
+    unindexed: &mut bool,
+) -> bool {
+    if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+        let index = index as usize;
+        if indexes.remove(&index) {
+            return true;
+        }
+        if *unindexed && indexes.is_empty() {
+            *unindexed = false;
+            return true;
+        }
+        return false;
+    }
+    let streamed = *unindexed || !indexes.is_empty();
+    *unindexed = false;
+    indexes.clear();
+    streamed
+}
+
+fn requests_reasoning_summary(model: &crate::model::ModelSpec) -> bool {
+    model.reasoning.enabled
+        || model.reasoning.effort.is_some()
+        || model_id_requests_reasoning_summary(&model.model_id)
+}
+
+fn model_id_requests_reasoning_summary(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    [
+        "gemini", "gpt-5", "gpt-6", "gpt5", "gpt6", "grok", "claude", "opus", "sonnet", "o1", "o3",
+        "o4",
+    ]
+    .into_iter()
+    .any(|marker| model_id_has_marker(&model_id, marker))
+}
+
+fn model_id_has_marker(model_id: &str, marker: &str) -> bool {
+    model_id.match_indices(marker).any(|(index, _)| {
+        let before = index == 0 || !model_id.as_bytes()[index - 1].is_ascii_alphanumeric();
+        let end = index + marker.len();
+        let after = end == model_id.len() || !model_id.as_bytes()[end].is_ascii_alphanumeric();
+        before && after
+    })
+}
+
+fn reasoning_visible_text(item: &Value) -> String {
+    let mut pieces = Vec::new();
+    if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+        for part in summary {
+            if let Some(text) = summary_piece_text(part) {
+                pieces.push(text);
+            }
+        }
+    }
+    if let Some(content) = item.get("content").and_then(Value::as_array) {
+        for part in content {
+            if let Some(text) = content_piece_text(part) {
+                pieces.push(text);
+            }
+        }
+    }
+    if let Some(text) = item
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        pieces.push(text.to_owned());
+    }
+    pieces.join("\n")
+}
+
+fn summary_piece_text(part: &Value) -> Option<String> {
+    let object = part.as_object()?;
+    non_empty_text(object.get("text")).or_else(|| {
+        object.get("summary_text").and_then(|summary| {
+            non_empty_text(Some(summary)).or_else(|| non_empty_text(summary.get("text")))
+        })
+    })
+}
+
+fn content_piece_text(part: &Value) -> Option<String> {
+    if let Some(text) = part.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_owned());
+    }
+    let object = part.as_object()?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("reasoning_text" | "summary_text" | "text") => non_empty_text(object.get("text")),
+        _ => None,
+    }
+}
+
+fn non_empty_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 fn response_item_text(item: &Value) -> Option<String> {
     let text = item
         .get("content")?
@@ -369,7 +505,7 @@ fn apply_model(
     if let Some(max) = model.max_output_tokens.or(route_max_output_tokens) {
         object.insert("max_output_tokens".into(), json!(max));
     }
-    if model.reasoning.enabled || model.reasoning.effort.is_some() {
+    if requests_reasoning_summary(model) {
         let mut reasoning = Map::new();
         reasoning.insert("summary".into(), json!("auto"));
         if let Some(effort) = &model.reasoning.effort {
@@ -529,10 +665,23 @@ pub(crate) fn responses_usage(value: &Value) -> Usage {
         context_input_tokens: input_tokens,
         output_tokens: value.get("output_tokens").and_then(Value::as_u64),
         total_tokens: value.get("total_tokens").and_then(Value::as_u64),
-        cache_read_tokens: value
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64),
-        cache_write_tokens: None,
+        cache_read_tokens: super::first_reported_u64(
+            value,
+            &[
+                "/input_tokens_details/cached_tokens",
+                "/prompt_tokens_details/cached_tokens",
+            ],
+        ),
+        cache_write_tokens: super::first_reported_u64(
+            value,
+            &[
+                "/input_tokens_details/cache_write_tokens",
+                "/input_tokens_details/cache_creation_tokens",
+                "/input_tokens_details/cache_creation_input_tokens",
+                "/cache_creation_input_tokens",
+                "/cache_write_tokens",
+            ],
+        ),
         reasoning_tokens: value
             .pointer("/output_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64),
@@ -542,7 +691,94 @@ pub(crate) fn responses_usage(value: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ProviderReplayState;
+    use crate::model::{ModelSpec, ProviderReplayState};
+
+    #[test]
+    fn responses_usage_records_gateway_cache_write() {
+        let usage = responses_usage(&json!({
+            "input_tokens": 1000,
+            "output_tokens": 10,
+            "total_tokens": 1010,
+            "input_tokens_details": {
+                "cached_tokens": 128,
+                "cache_write_tokens": 512
+            }
+        }));
+
+        assert_eq!(usage.cache_read_tokens, Some(128));
+        assert_eq!(usage.cache_write_tokens, Some(512));
+    }
+
+    #[test]
+    fn responses_usage_prefers_a_later_positive_cache_write() {
+        let usage = responses_usage(&json!({
+            "input_tokens": 1000,
+            "input_tokens_details": { "cache_write_tokens": 0 },
+            "cache_creation_input_tokens": 512
+        }));
+
+        assert_eq!(usage.cache_write_tokens, Some(512));
+    }
+
+    #[test]
+    fn reasoning_stays_requested_when_enabled_without_a_known_name() {
+        let mut model = ModelSpec::new("plain-chat");
+        model.reasoning.enabled = true;
+        model.reasoning.effort = None;
+        let mut body = json!({});
+        apply_model(&mut body, &model, None).unwrap();
+        assert_eq!(body["reasoning"], json!({ "summary": "auto" }));
+    }
+
+    #[test]
+    fn reasoning_name_match_uses_marker_boundaries() {
+        assert!(model_id_requests_reasoning_summary("gpt-6.1-sol"));
+        assert!(model_id_requests_reasoning_summary("o1-preview"));
+        assert!(!model_id_requests_reasoning_summary("foo1"));
+        assert!(!model_id_requests_reasoning_summary("plain-chat"));
+    }
+
+    #[test]
+    fn responses_usage_leaves_cache_write_empty_when_unreported() {
+        let usage = responses_usage(&json!({
+            "input_tokens": 51295,
+            "output_tokens": 26,
+            "input_tokens_details": { "cached_tokens": 0 }
+        }));
+
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert!(usage.cache_write_tokens.is_none());
+    }
+
+    #[test]
+    fn apply_model_requests_summary_for_gemini_without_effort() {
+        let mut model = ModelSpec::new("gemini-4-argon");
+        model.reasoning.enabled = false;
+        model.reasoning.effort = None;
+        let mut body = json!({});
+        apply_model(&mut body, &model, None).unwrap();
+        assert_eq!(body["reasoning"], json!({ "summary": "auto" }));
+        assert!(body["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn apply_model_omits_reasoning_for_plain_chat() {
+        let mut model = ModelSpec::new("plain-chat");
+        model.reasoning.enabled = false;
+        model.reasoning.effort = None;
+        let mut body = json!({});
+        apply_model(&mut body, &model, None).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn reasoning_visible_text_reads_summary_text() {
+        let item = json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "why"}]
+        });
+        assert_eq!(reasoning_visible_text(&item), "why");
+    }
 
     #[test]
     fn reasoning_replay_projects_response_items_to_valid_input_items() {
