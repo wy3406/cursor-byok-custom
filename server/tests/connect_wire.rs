@@ -361,7 +361,6 @@ async fn inference_prompt_keeps_assistant_tool_call() {
                 raw_tool_call_args: r#"{"q":1}"#.into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     };
