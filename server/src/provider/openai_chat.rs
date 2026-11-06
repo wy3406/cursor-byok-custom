@@ -174,8 +174,8 @@ impl Provider for OpenAiChatProvider {
                         let id = tool.get("id").and_then(Value::as_str);
                         let function = tool.get("function").unwrap_or(&Value::Null);
                         let name = function.get("name").and_then(Value::as_str);
-                        let arguments = function.get("arguments").and_then(Value::as_str);
-                        for event in update_chat_tool(index, id, name, arguments, &mut tools) { yield event; }
+                        let arguments = json_text(function.get("arguments"));
+                        for event in update_chat_tool(index, id, name, arguments.as_deref(), &mut tools) { yield event; }
                     }
                 }
                 if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
@@ -358,6 +358,14 @@ fn role_name(role: &Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+    }
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        value @ (Value::Object(_) | Value::Array(_)) => serde_json::to_string(value).ok(),
+        _ => None,
     }
 }
 

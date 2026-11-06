@@ -328,6 +328,11 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
                 description: "Read a file.".into(),
                 parameters: Vec::new(),
             },
+            inf::InferenceAgentTool {
+                name: "GetMcpTools".into(),
+                description: "List MCP tools.".into(),
+                parameters: Vec::new(),
+            },
         ],
         ..Default::default()
     };
@@ -336,7 +341,7 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
         .unwrap();
     assert_eq!(projected.prompt.instructions, "stay brief");
     assert_eq!(projected.model.model_id, "model-alpha");
-    assert_eq!(projected.prompt.tools.len(), 2);
+    assert_eq!(projected.prompt.tools.len(), 3);
     assert_eq!(projected.prompt.tools[0].name, "lookup");
     assert_eq!(
         projected.prompt.tools[0]
@@ -345,10 +350,20 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
             .and_then(|value| value.as_str()),
         Some("string")
     );
-    assert!(projected.prompt.tools[1]
-        .parameters
-        .as_object()
-        .is_some_and(|object| object.is_empty()));
+    assert_eq!(
+        projected.prompt.tools[1]
+            .parameters
+            .pointer("/properties/path/type")
+            .and_then(|value| value.as_str()),
+        Some("string")
+    );
+    assert_eq!(
+        projected.prompt.tools[2]
+            .parameters
+            .pointer("/properties/toolName/type")
+            .and_then(|value| value.as_str()),
+        Some("string")
+    );
     assert_eq!(projected.history.len(), 2);
     assert!(matches!(
         projected.history[1].role,

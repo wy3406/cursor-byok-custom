@@ -203,9 +203,9 @@ impl Provider for OpenAiResponsesProvider {
                                 saw_completed_item = true;
                                 let index = required_u64(&value, "output_index")? as usize;
                                 saw_tool = true;
-                                let arguments = item
-                                    .get("arguments")
-                                    .and_then(Value::as_str)
+                                let owned = json_text(item.get("arguments"));
+                                let arguments = owned
+                                    .as_deref()
                                     .map_or(ResponseToolArguments::None, ResponseToolArguments::Snapshot);
                                 for event in update_response_tool(index, item, arguments, true, &mut tools)? { yield event; }
                             }
@@ -221,7 +221,8 @@ impl Provider for OpenAiResponsesProvider {
                     }
                     "response.function_call_arguments.done" => {
                         let index = required_u64(&value, "output_index")? as usize;
-                        match value.get("arguments").and_then(Value::as_str) {
+                        let owned = json_text(value.get("arguments"));
+                        match owned.as_deref() {
                             Some("") => {
                                 for event in update_response_tool(
                                     index,
@@ -459,6 +460,8 @@ fn update_response_tool(
         ResponseToolArguments::Snapshot(snapshot) if snapshot.starts_with(&tool.arguments) => {
             tool.arguments.push_str(&snapshot[tool.arguments.len()..]);
         }
+        ResponseToolArguments::Snapshot(snapshot)
+            if json_values_match(&tool.arguments, snapshot) => {}
         ResponseToolArguments::Snapshot(_) => {
             return Err(Error::Provider(
                 "OpenAI Responses final tool arguments do not match streamed arguments".into(),
@@ -651,6 +654,24 @@ fn role_name(role: &Role) -> &'static str {
     }
 }
 
+fn json_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        value @ (Value::Object(_) | Value::Array(_)) => serde_json::to_string(value).ok(),
+        _ => None,
+    }
+}
+
+fn json_values_match(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<Value>(left),
+        serde_json::from_str::<Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn required_u64(value: &Value, name: &str) -> Result<u64> {
     value
         .get(name)
@@ -692,6 +713,34 @@ pub(crate) fn responses_usage(value: &Value) -> Usage {
 mod tests {
     use super::*;
     use crate::model::{ModelSpec, ProviderReplayState};
+    use crate::provider::ModelEvent;
+
+    #[test]
+    fn object_function_arguments_reach_the_tool_call() {
+        let item = json!({
+            "call_id": "call-1",
+            "name": "Read",
+            "arguments": {"path": "C:/repo/file.txt"}
+        });
+        let owned = json_text(item.get("arguments")).expect("object arguments");
+        let mut tools = std::collections::BTreeMap::new();
+        let events = update_response_tool(
+            0,
+            &item,
+            ResponseToolArguments::Snapshot(&owned),
+            true,
+            &mut tools,
+        )
+        .unwrap();
+        let delta = events.iter().find_map(|event| match event {
+            ModelEvent::ToolCallArgumentsDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        });
+        assert_eq!(delta, Some(owned.as_str()));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCallEnd { index: 0 })));
+    }
 
     #[test]
     fn responses_usage_records_gateway_cache_write() {

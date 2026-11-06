@@ -200,7 +200,7 @@ fn project_tools(tools: &[InferenceAgentTool]) -> Vec<ToolDefinition> {
         .map(|tool| ToolDefinition {
             name: tool.name.clone(),
             description: tool.description.clone(),
-            parameters: parameters_value(&tool.parameters),
+            parameters: restore_empty_tool_schema(&tool.name, parameters_value(&tool.parameters)),
         })
         .collect()
 }
@@ -309,6 +309,88 @@ fn unwrap_embedded_schema(value: serde_json::Value) -> serde_json::Value {
         }
     }
     value
+}
+
+fn restore_empty_tool_schema(name: &str, parameters: serde_json::Value) -> serde_json::Value {
+    if !parameters
+        .as_object()
+        .is_some_and(|object| object.is_empty())
+    {
+        return parameters;
+    }
+    known_latest_tool_schema(name).unwrap_or(parameters)
+}
+
+fn known_latest_tool_schema(name: &str) -> Option<serde_json::Value> {
+    let string =
+        |description: &str| serde_json::json!({ "type": "string", "description": description });
+    let integer =
+        |description: &str| serde_json::json!({ "type": "integer", "description": description });
+    let schema = match name {
+        "Read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": string("The absolute path of the file to read."),
+                "offset": integer("The line number to start reading from."),
+                "limit": integer("The number of lines to read.")
+            },
+            "required": ["path"]
+        }),
+        "Delete" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": string("The absolute path of the file to delete.")
+            },
+            "required": ["path"]
+        }),
+        "Shell" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": string("The command to execute."),
+                "working_directory": string("The absolute path of the working directory.")
+            },
+            "required": ["command"]
+        }),
+        "Grep" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": string("The regular expression pattern to search for in file contents."),
+                "path": string("File or directory to search in. Defaults to the workspace root."),
+                "glob": string("Glob pattern to filter files."),
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": "Output mode."
+                }
+            },
+            "required": ["pattern"]
+        }),
+        "Glob" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "glob_pattern": string("The glob pattern to match files against."),
+                "target_directory": string("Absolute path of the directory to search. Defaults to the workspace root.")
+            },
+            "required": ["glob_pattern"]
+        }),
+        "LS" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target_directory": string("Absolute path of the directory to list.")
+            },
+            "required": ["target_directory"]
+        }),
+        "GetMcpTools" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": string("MCP server identifier to inspect."),
+                "toolName": string("Tool name within the server. Requires server to be set."),
+                "pattern": string("RE2 pattern to search server and tool names.")
+            }
+        }),
+        _ => return None,
+    };
+    Some(schema)
 }
 
 fn json_schema_has_fields(value: &serde_json::Value) -> bool {
@@ -621,14 +703,32 @@ async fn fetch_remote_media(url: &str, mime_hint: &str) -> Result<ContentPart> {
 }
 
 fn value_text(bytes: &[u8]) -> String {
-    let Ok(value) = prost_types::Value::decode(bytes) else {
+    if bytes.is_empty() {
         return String::new();
-    };
-    kind_text(value.kind.as_ref(), 0)
+    }
+    if let Ok(value) = prost_types::Value::decode(bytes) {
+        return kind_text(value.kind.as_ref(), 0);
+    }
+    if let Some(text) = struct_text(bytes) {
+        return text;
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    String::new()
+}
+
+fn struct_text(bytes: &[u8]) -> Option<String> {
+    let message = prost_types::Struct::decode(bytes).ok()?;
+    let text = serde_json::to_string(&struct_json(&message)).ok()?;
+    (text != "{}").then_some(text)
 }
 
 fn kind_text(kind: Option<&Kind>, depth: usize) -> String {
-    if depth > 4 {
+    if depth > 12 {
         return String::new();
     }
     match kind {
@@ -1302,5 +1402,58 @@ fn emit(handle: &TransportHandle, message: &RunInferenceServerMessage) -> Result
         Ok(())
     } else {
         Err(Error::RunNotFound(handle.request_id().to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+    use prost_types::value::Kind;
+
+    fn encode(message: &impl Message) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn value_text_keeps_protobuf_string() {
+        let value = prost_types::Value {
+            kind: Some(Kind::StringValue("Read path".into())),
+        };
+        assert_eq!(super::value_text(&encode(&value)), "Read path");
+    }
+
+    #[test]
+    fn value_text_keeps_empty_value_empty() {
+        let value = prost_types::Value {
+            kind: Some(Kind::NullValue(0)),
+        };
+        assert!(super::value_text(&encode(&value)).is_empty());
+    }
+
+    #[test]
+    fn value_text_reads_struct_fields_as_json() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "name".into(),
+            prost_types::Value {
+                kind: Some(Kind::StringValue("Read".into())),
+            },
+        );
+        let message = prost_types::Struct { fields };
+        let bytes = encode(&message);
+        let text = super::value_text(&bytes);
+        assert!(text.contains("\"name\":\"Read\""), "{text}");
+        assert_ne!(text, String::from_utf8_lossy(&bytes).trim());
+    }
+
+    #[test]
+    fn value_text_keeps_plain_utf8_when_protobuf_does_not_decode() {
+        let bytes = b"available tools: Read, Glob, Grep";
+        assert_eq!(
+            super::value_text(bytes),
+            "available tools: Read, Glob, Grep"
+        );
     }
 }
