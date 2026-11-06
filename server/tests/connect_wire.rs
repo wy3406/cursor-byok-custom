@@ -327,7 +327,6 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
                 name: "Read".into(),
                 description: "Read a file.".into(),
                 parameters: Vec::new(),
-                ..Default::default()
             },
         ],
         ..Default::default()
