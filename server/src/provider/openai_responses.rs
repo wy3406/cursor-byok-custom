@@ -194,6 +194,16 @@ impl Provider for OpenAiResponsesProvider {
                             }
                             Some("message") => {
                                 saw_completed_item = true;
+                                let thought = reasoning_visible_text(item);
+                                if !thinking_open && !thought.is_empty() {
+                                    thinking_open = true;
+                                    yield ModelEvent::ThinkingStart;
+                                    yield ModelEvent::ThinkingDelta(thought);
+                                    reasoning_items.push(json!({
+                                        "type": "reasoning",
+                                        "summary": reasoning_visible_text(item)
+                                    }));
+                                }
                                 if let Some(final_text) = response_item_text(item) {
                                     for event in reconcile_response_text(&mut text_open, &mut text, &final_text) { yield event; }
                                 }
@@ -395,20 +405,20 @@ fn unseen_reasoning_events(
     };
     let mut events = Vec::new();
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        let text = reasoning_visible_text(item);
+        if text.is_empty() {
             continue;
         }
         let id = item.get("id").and_then(Value::as_str);
         let already = seen.iter().any(|previous| {
-            previous.get("id").and_then(Value::as_str) == id && id.is_some()
-                || reasoning_visible_text(previous) == reasoning_visible_text(item)
-                    && !reasoning_visible_text(item).is_empty()
+            let same_id = id.is_some() && previous.get("id").and_then(Value::as_str) == id;
+            let same_text = reasoning_visible_text(previous) == text;
+            same_id || same_text
         });
         if already {
             continue;
         }
-        let text = reasoning_visible_text(item);
-        if !text.is_empty() && !*thinking_open {
+        if !*thinking_open {
             *thinking_open = true;
             events.push(ModelEvent::ThinkingStart);
             events.push(ModelEvent::ThinkingDelta(text));
@@ -433,8 +443,14 @@ fn content_piece_text(part: &Value) -> Option<String> {
     }
     let object = part.as_object()?;
     match object.get("type").and_then(Value::as_str) {
-        Some("reasoning_text" | "summary_text" | "text") => non_empty_text(object.get("text")),
-        _ => None,
+        Some("thinking" | "reasoning" | "reasoning_text" | "summary_text") => non_empty_text(
+            object
+                .get("thinking")
+                .or_else(|| object.get("text"))
+                .or_else(|| object.get("summary_text")),
+        ),
+        Some("text") => non_empty_text(object.get("text")),
+        _ => non_empty_text(object.get("thinking")),
     }
 }
 
@@ -877,6 +893,19 @@ mod tests {
         let mut body = json!({});
         apply_model(&mut body, &model, None).unwrap();
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn message_thinking_field_is_separate_from_the_reply() {
+        let item = json!({
+            "type": "message",
+            "content": [
+                {"type": "thinking", "thinking": "先确认用户在打招呼"},
+                {"type": "output_text", "text": "你好！"}
+            ]
+        });
+        assert_eq!(reasoning_visible_text(&item), "先确认用户在打招呼");
+        assert_eq!(response_item_text(&item).as_deref(), Some("你好！"));
     }
 
     #[test]
