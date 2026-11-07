@@ -27,21 +27,22 @@ use crate::{
             proto::inference::v1::{
                 inference_content_part, inference_core_message, inference_stream_response,
                 run_inference_client_message, run_inference_server_message, InferenceAgentTool,
-                InferenceContentPart, InferenceCoreMessage, InferenceStreamRequest,
-                InferenceStreamResponse, InferenceTextStreamPart, InferenceThinkingStreamPart,
-                InferenceToolCall, InferenceToolCallStreamPart, InferenceToolResultContent,
-                RunInferenceCompressedRequest, RunInferenceHeartbeat, RunInferenceInvocationEnd,
-                RunInferenceInvocationError, RunInferenceInvocationResponse,
-                RunInferenceInvokeModel, RunInferencePromptModelMetadata,
-                RunInferenceRoutingMessage, RunInferenceRunReady, RunInferenceRunRequest,
-                RunInferenceServerMessage,
+                InferenceContentPart, InferenceCoreMessage, InferenceModelParameterValue,
+                InferenceStreamRequest, InferenceStreamResponse, InferenceTextStreamPart,
+                InferenceThinkingStreamPart, InferenceToolCall, InferenceToolCallStreamPart,
+                InferenceToolResultContent, RunInferenceCompressedRequest, RunInferenceHeartbeat,
+                RunInferenceInvocationEnd, RunInferenceInvocationError,
+                RunInferenceInvocationResponse, RunInferenceInvokeModel,
+                RunInferencePromptModelMetadata, RunInferenceRoutingMessage, RunInferenceRunReady,
+                RunInferenceRunRequest, RunInferenceServerMessage,
             },
         },
         transport::{TransportHandle, TransportParent, TransportRegistry},
     },
     model::{
-        ContentPart, ModelInvocation, ModelRequest, ModelSpec, ModelType, ProjectedContent,
-        ProjectedMessage, PromptSpec, Role, ToolCallContent, ToolDefinition, ToolResultContent,
+        ContentPart, ModelInvocation, ModelLatency, ModelRequest, ModelSpec, ModelType,
+        ProjectedContent, ProjectedMessage, PromptSpec, Role, ToolCallContent, ToolDefinition,
+        ToolResultContent,
     },
     provider::ModelEvent,
     Error, Result,
@@ -59,15 +60,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 struct Session {
     model_id: String,
     routing_text: String,
+    parameters: Vec<InferenceModelParameterValue>,
     generation: CancellationToken,
     heartbeats: CancellationToken,
 }
 
 impl Session {
-    fn new(model_id: String, routing_text: String) -> Self {
+    fn new(
+        model_id: String,
+        routing_text: String,
+        parameters: Vec<InferenceModelParameterValue>,
+    ) -> Self {
         Self {
             model_id,
             routing_text,
+            parameters,
             generation: CancellationToken::new(),
             heartbeats: CancellationToken::new(),
         }
@@ -322,75 +329,34 @@ fn restore_empty_tool_schema(name: &str, parameters: serde_json::Value) -> serde
 }
 
 fn known_latest_tool_schema(name: &str) -> Option<serde_json::Value> {
-    let string =
-        |description: &str| serde_json::json!({ "type": "string", "description": description });
-    let integer =
-        |description: &str| serde_json::json!({ "type": "integer", "description": description });
-    let schema = match name {
-        "Read" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": string("The absolute path of the file to read."),
-                "offset": integer("The line number to start reading from."),
-                "limit": integer("The number of lines to read.")
-            },
-            "required": ["path"]
-        }),
-        "Delete" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": string("The absolute path of the file to delete.")
-            },
-            "required": ["path"]
-        }),
-        "Shell" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": string("The command to execute."),
-                "working_directory": string("The absolute path of the working directory.")
-            },
-            "required": ["command"]
-        }),
-        "Grep" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": string("The regular expression pattern to search for in file contents."),
-                "path": string("File or directory to search in. Defaults to the workspace root."),
-                "glob": string("Glob pattern to filter files."),
-                "output_mode": {
-                    "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode."
-                }
-            },
-            "required": ["pattern"]
-        }),
-        "Glob" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "glob_pattern": string("The glob pattern to match files against."),
-                "target_directory": string("Absolute path of the directory to search. Defaults to the workspace root.")
-            },
-            "required": ["glob_pattern"]
-        }),
-        "LS" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "target_directory": string("Absolute path of the directory to list.")
-            },
-            "required": ["target_directory"]
-        }),
-        "GetMcpTools" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "server": string("MCP server identifier to inspect."),
-                "toolName": string("Tool name within the server. Requires server to be set."),
-                "pattern": string("RE2 pattern to search server and tool names.")
-            }
-        }),
-        _ => return None,
+    static SCHEMAS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    SCHEMAS
+        .get_or_init(cursor_tool_parameters)
+        .get(name)
+        .cloned()
+}
+
+fn cursor_tool_parameters() -> serde_json::Map<String, serde_json::Value> {
+    let document: serde_json::Value =
+        serde_json::from_str(include_str!("../../../prompt/cursor/tools.json"))
+            .expect("cursor tool definitions are valid");
+    let mut schemas = serde_json::Map::new();
+    let Some(tools) = document.get("tools").and_then(serde_json::Value::as_array) else {
+        return schemas;
     };
-    Some(schema)
+    for tool in tools {
+        let Some(function) = tool.get("function") else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(parameters) = function.get("parameters").cloned() else {
+            continue;
+        };
+        schemas.insert(name.to_owned(), parameters);
+    }
+    schemas
 }
 
 fn json_schema_has_fields(value: &serde_json::Value) -> bool {
@@ -906,7 +872,8 @@ async fn open_run(
         previous.heartbeats.cancel();
         previous.generation.cancel();
     }
-    let session = Session::new(model.model_id.clone(), routing_text);
+    let parameters = model.parameters.clone();
+    let session = Session::new(model.model_id.clone(), routing_text, parameters);
     let heartbeats = session.heartbeats.clone();
     table.insert(handle.request_id().to_owned(), session);
     drop(table);
@@ -951,12 +918,12 @@ async fn start_invocation(
 ) -> Result<()> {
     let request = stream_request(&invoke)?;
     let invocation_id = invoke.invocation_id.clone();
-    let (model_id, routing_text, cancel, heartbeats) = {
+    let (model_id, routing_text, parameters, cancel, heartbeats) = {
         let mut table = sessions().lock().await;
         let created = !table.contains_key(handle.request_id());
         let session = table
             .entry(handle.request_id().to_owned())
-            .or_insert_with(|| Session::new(String::new(), String::new()));
+            .or_insert_with(|| Session::new(String::new(), String::new(), Vec::new()));
         if session.model_id.is_empty() {
             session.model_id = request_model_id(&request);
         }
@@ -965,6 +932,7 @@ async fn start_invocation(
         (
             session.model_id.clone(),
             session.routing_text.clone(),
+            session.parameters.clone(),
             session.generation.clone(),
             created.then(|| session.heartbeats.clone()),
         )
@@ -973,6 +941,10 @@ async fn start_invocation(
         spawn_heartbeats(handle.clone(), heartbeats);
     }
     let mut projected = project_prompt(&request, &routing_text).await?;
+    apply_requested_parameters(&mut projected.model, &parameters);
+    if let Some(model) = &request.requested_model {
+        apply_requested_parameters(&mut projected.model, &model.parameters);
+    }
     if projected.model.model_id.is_empty() {
         projected.model.model_id = model_id;
     }
@@ -1158,6 +1130,28 @@ fn routing_user_text(routing: &[RunInferenceRoutingMessage]) -> String {
         .map(|message| message.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn apply_requested_parameters(spec: &mut ModelSpec, parameters: &[InferenceModelParameterValue]) {
+    for parameter in parameters {
+        match parameter.id.as_str() {
+            "effort" | "reasoning" => {
+                let effort = parameter.value.trim();
+                if !effort.is_empty() && effort != "none" {
+                    spec.reasoning.effort = Some(effort.to_owned());
+                    spec.reasoning.enabled = true;
+                }
+            }
+            "fast" if parameter.value == "true" => spec.latency = ModelLatency::Fast,
+            "fast" if parameter.value == "false" => spec.latency = ModelLatency::Standard,
+            "context" => {
+                if let Some(tokens) = crate::model::parse_token_count(&parameter.value) {
+                    spec.context_window_tokens = Some(tokens);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn request_model_id(request: &InferenceStreamRequest) -> String {
@@ -1455,5 +1449,21 @@ mod tests {
             super::value_text(bytes),
             "available tools: Read, Glob, Grep"
         );
+    }
+
+    #[test]
+    fn cursor_medium_effort_reaches_the_model_spec() {
+        let mut spec = crate::model::ModelSpec::new("gemini-4-argon");
+        super::apply_requested_parameters(
+            &mut spec,
+            &[
+                crate::cursor::protocol::proto::inference::v1::InferenceModelParameterValue {
+                    id: "reasoning".into(),
+                    value: "medium".into(),
+                },
+            ],
+        );
+        assert_eq!(spec.reasoning.effort.as_deref(), Some("medium"));
+        assert!(spec.reasoning.enabled);
     }
 }

@@ -333,6 +333,16 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
                 description: "List MCP tools.".into(),
                 parameters: Vec::new(),
             },
+            inf::InferenceAgentTool {
+                name: "StrReplace".into(),
+                description: "Replace text.".into(),
+                parameters: Vec::new(),
+            },
+            inf::InferenceAgentTool {
+                name: "Write".into(),
+                description: "Write a file.".into(),
+                parameters: Vec::new(),
+            },
         ],
         ..Default::default()
     };
@@ -341,7 +351,7 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
         .unwrap();
     assert_eq!(projected.prompt.instructions, "stay brief");
     assert_eq!(projected.model.model_id, "model-alpha");
-    assert_eq!(projected.prompt.tools.len(), 3);
+    assert_eq!(projected.prompt.tools.len(), 5);
     assert_eq!(projected.prompt.tools[0].name, "lookup");
     assert_eq!(
         projected.prompt.tools[0]
@@ -363,6 +373,34 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
             .pointer("/properties/toolName/type")
             .and_then(|value| value.as_str()),
         Some("string")
+    );
+    assert_eq!(
+        projected.prompt.tools[3]
+            .parameters
+            .pointer("/required")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .as_deref(),
+        Some(["path", "old_string", "new_string"].as_slice())
+    );
+    assert_eq!(
+        projected.prompt.tools[4]
+            .parameters
+            .pointer("/required")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .as_deref(),
+        Some(["path", "contents"].as_slice())
     );
     assert_eq!(projected.history.len(), 2);
     assert!(matches!(

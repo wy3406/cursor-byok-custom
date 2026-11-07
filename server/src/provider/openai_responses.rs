@@ -241,15 +241,17 @@ impl Provider for OpenAiResponsesProvider {
                             }
                         }
                     }
-                    "response.completed" => {
-                        if let Some(usage) = value.pointer("/response/usage") { yield ModelEvent::Usage(responses_usage(usage)); }
+                    "response.completed" | "response.incomplete" => {
+                        let response = value.get("response").unwrap_or(&Value::Null);
+                        if let Some(usage) = response.get("usage") { yield ModelEvent::Usage(responses_usage(usage)); }
+                        for event in unseen_reasoning_events(response, &mut reasoning_items, &mut thinking_open) { yield event; }
                         if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                         if text_open { text_open = false; yield ModelEvent::TextEnd; }
                         for (index, tool) in tools.iter_mut().filter(|(_, tool)| tool.started && !tool.ended) {
                             tool.ended = true;
                             yield ModelEvent::ToolCallEnd { index: *index };
                         }
-                        if tools.values().any(|tool| !tool.started) {
+                        if kind == "response.completed" && tools.values().any(|tool| !tool.started) {
                             Err(Error::Provider("OpenAI Responses completed with incomplete tool metadata".into()))?;
                         }
                         terminal = true;
@@ -261,17 +263,13 @@ impl Provider for OpenAiResponsesProvider {
                                 },
                             );
                         }
-                        yield ModelEvent::Done(if saw_tool { FinishReason::ToolUse } else { FinishReason::Stop });
-                    }
-                    "response.incomplete" => {
-                        if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
-                        if text_open { text_open = false; yield ModelEvent::TextEnd; }
-                        for (index, tool) in tools.iter_mut().filter(|(_, tool)| tool.started && !tool.ended) {
-                            tool.ended = true;
-                            yield ModelEvent::ToolCallEnd { index: *index };
-                        }
-                        terminal = true;
-                        yield ModelEvent::Done(FinishReason::Length);
+                        yield ModelEvent::Done(if saw_tool {
+                            FinishReason::ToolUse
+                        } else if kind == "response.incomplete" {
+                            FinishReason::Length
+                        } else {
+                            FinishReason::Stop
+                        });
                     }
                     _ => {}
                 }
@@ -359,12 +357,16 @@ fn model_id_has_marker(model_id: &str, marker: &str) -> bool {
 
 fn reasoning_visible_text(item: &Value) -> String {
     let mut pieces = Vec::new();
-    if let Some(summary) = item.get("summary").and_then(Value::as_array) {
-        for part in summary {
-            if let Some(text) = summary_piece_text(part) {
-                pieces.push(text);
+    match item.get("summary") {
+        Some(Value::String(text)) if !text.is_empty() => pieces.push(text.clone()),
+        Some(Value::Array(summary)) => {
+            for part in summary {
+                if let Some(text) = summary_piece_text(part) {
+                    pieces.push(text);
+                }
             }
         }
+        _ => {}
     }
     if let Some(content) = item.get("content").and_then(Value::as_array) {
         for part in content {
@@ -381,6 +383,39 @@ fn reasoning_visible_text(item: &Value) -> String {
         pieces.push(text.to_owned());
     }
     pieces.join("\n")
+}
+
+fn unseen_reasoning_events(
+    response: &Value,
+    seen: &mut Vec<Value>,
+    thinking_open: &mut bool,
+) -> Vec<ModelEvent> {
+    let Some(items) = response.get("output").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let id = item.get("id").and_then(Value::as_str);
+        let already = seen.iter().any(|previous| {
+            previous.get("id").and_then(Value::as_str) == id && id.is_some()
+                || reasoning_visible_text(previous) == reasoning_visible_text(item)
+                    && !reasoning_visible_text(item).is_empty()
+        });
+        if already {
+            continue;
+        }
+        let text = reasoning_visible_text(item);
+        if !text.is_empty() && !*thinking_open {
+            *thinking_open = true;
+            events.push(ModelEvent::ThinkingStart);
+            events.push(ModelEvent::ThinkingDelta(text));
+        }
+        seen.push(item.clone());
+    }
+    events
 }
 
 fn summary_piece_text(part: &Value) -> Option<String> {
@@ -714,6 +749,30 @@ mod tests {
     use super::*;
     use crate::model::{ModelSpec, ProviderReplayState};
     use crate::provider::ModelEvent;
+
+    #[test]
+    fn completed_response_output_keeps_reasoning_summary() {
+        let response = json!({
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": "先看用户只是在打招呼"
+            }, {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "你好！"}]
+            }]
+        });
+        let mut seen = Vec::new();
+        let mut thinking_open = false;
+        let events = unseen_reasoning_events(&response, &mut seen, &mut thinking_open);
+        assert!(thinking_open);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ThinkingDelta(text) if text == "先看用户只是在打招呼"
+        )));
+        let again = unseen_reasoning_events(&response, &mut seen, &mut thinking_open);
+        assert!(again.is_empty());
+    }
 
     #[test]
     fn object_function_arguments_reach_the_tool_call() {
