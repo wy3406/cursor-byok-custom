@@ -120,6 +120,7 @@ impl Provider for OpenAiResponsesProvider {
             let mut saw_tool = false;
             let mut saw_completed_item = false;
             let mut terminal = false;
+            let mut reply_split = ReplySplit::default();
             loop {
                 let event = tokio::select! {
                     _ = cancellation.cancelled() => { return; }
@@ -135,16 +136,20 @@ impl Provider for OpenAiResponsesProvider {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or(&event.event);
                 match kind {
                     "response.output_text.delta" => {
-                        if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
-                        if !text_open { text_open = true; yield ModelEvent::TextStart; }
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                            text.push_str(delta);
-                            yield ModelEvent::TextDelta(delta.into());
+                            for event in reply_events(reply_split.push(delta), &mut text_open, &mut text, &mut thinking_open) {
+                                yield event;
+                            }
                         }
                     }
                     "response.output_text.done" => {
                         if let Some(final_text) = value.get("text").and_then(Value::as_str) {
-                            for event in reconcile_response_text(&mut text_open, &mut text, final_text) { yield event; }
+                            for event in accept_output_text(&mut reply_split, &mut text_open, &mut text, &mut thinking_open, final_text) {
+                                yield event;
+                            }
+                        }
+                        for event in reply_events(reply_split.finish(), &mut text_open, &mut text, &mut thinking_open) {
+                            yield event;
                         }
                         if text_open { text_open = false; yield ModelEvent::TextEnd; }
                     }
@@ -164,6 +169,10 @@ impl Provider for OpenAiResponsesProvider {
                     "response.output_item.added" => {
                         let item = value.get("item").unwrap_or(&Value::Null);
                         if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            for event in reply_events(reply_split.close_for_tool(), &mut text_open, &mut text, &mut thinking_open) {
+                                yield event;
+                            }
+                            if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                             let index = required_u64(&value, "output_index")? as usize;
                             saw_tool = true;
                             for event in update_response_tool(index, item, ResponseToolArguments::None, false, &mut tools)? { yield event; }
@@ -204,12 +213,21 @@ impl Provider for OpenAiResponsesProvider {
                                     }));
                                 }
                                 if let Some(final_text) = response_item_text(item) {
-                                    for event in reconcile_response_text(&mut text_open, &mut text, &final_text) { yield event; }
+                                    for event in accept_output_text(&mut reply_split, &mut text_open, &mut text, &mut thinking_open, &final_text) {
+                                        yield event;
+                                    }
+                                    for event in reply_events(reply_split.finish(), &mut text_open, &mut text, &mut thinking_open) {
+                                        yield event;
+                                    }
                                 }
                                 if text_open { text_open = false; yield ModelEvent::TextEnd; }
                             }
                             Some("function_call") => {
                                 saw_completed_item = true;
+                                for event in reply_events(reply_split.close_for_tool(), &mut text_open, &mut text, &mut thinking_open) {
+                                    yield event;
+                                }
+                                if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                                 let index = required_u64(&value, "output_index")? as usize;
                                 saw_tool = true;
                                 let owned = json_text(item.get("arguments"));
@@ -302,6 +320,239 @@ impl Provider for OpenAiResponsesProvider {
                 Err(Error::Provider("OpenAI Responses stream ended without response.completed or response.incomplete".into()))?;
             }
         })
+    }
+}
+
+#[derive(Default)]
+struct ReplySplit {
+    raw: String,
+    held: String,
+    phase: ReplyPhase,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ReplyPhase {
+    #[default]
+    Probe,
+    Thinking,
+    Answer,
+}
+
+enum ReplyPiece {
+    Thinking(String),
+    Answer(String),
+}
+
+impl ReplySplit {
+    fn push(&mut self, delta: &str) -> Vec<ReplyPiece> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        self.raw.push_str(delta);
+        match self.phase {
+            ReplyPhase::Answer => vec![ReplyPiece::Answer(delta.to_owned())],
+            ReplyPhase::Probe => {
+                self.held.push_str(delta);
+                self.decide_probe(false)
+            }
+            ReplyPhase::Thinking => {
+                self.held.push_str(delta);
+                self.drain_thinking(false)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Vec<ReplyPiece> {
+        match self.phase {
+            ReplyPhase::Probe => self.decide_probe(true),
+            ReplyPhase::Thinking => self.drain_thinking(true),
+            ReplyPhase::Answer => Vec::new(),
+        }
+    }
+
+    fn close_for_tool(&mut self) -> Vec<ReplyPiece> {
+        let pieces = self.finish();
+        self.phase = ReplyPhase::Answer;
+        self.held.clear();
+        pieces
+    }
+
+    fn decide_probe(&mut self, force: bool) -> Vec<ReplyPiece> {
+        let first_line_done = self.held.contains('\n');
+        if !force
+            && !first_line_done
+            && could_be_thinking_heading(&self.held)
+            && self.held.len() < 80
+        {
+            return Vec::new();
+        }
+        if is_thinking_heading(&self.held) {
+            self.phase = ReplyPhase::Thinking;
+            return self.drain_thinking(force);
+        }
+        self.phase = ReplyPhase::Answer;
+        let held = std::mem::take(&mut self.held);
+        if held.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReplyPiece::Answer(held)]
+        }
+    }
+
+    fn drain_thinking(&mut self, force: bool) -> Vec<ReplyPiece> {
+        if let Some(at) = answer_boundary(&self.held, force) {
+            let thinking = self.held[..at].to_owned();
+            let answer = self.held[at..].to_owned();
+            self.held.clear();
+            self.phase = ReplyPhase::Answer;
+            let mut pieces = Vec::new();
+            if !thinking.is_empty() {
+                pieces.push(ReplyPiece::Thinking(thinking));
+            }
+            if !answer.is_empty() {
+                pieces.push(ReplyPiece::Answer(answer));
+            }
+            return pieces;
+        }
+        let hold = thinking_holdback(&self.held, force);
+        let emit_len = self.held.len().saturating_sub(hold);
+        if emit_len == 0 {
+            return Vec::new();
+        }
+        let emit = self.held[..emit_len].to_owned();
+        self.held.replace_range(..emit_len, "");
+        vec![ReplyPiece::Thinking(emit)]
+    }
+}
+
+fn accept_output_text(
+    split: &mut ReplySplit,
+    text_open: &mut bool,
+    text: &mut String,
+    thinking_open: &mut bool,
+    final_text: &str,
+) -> Vec<ModelEvent> {
+    let extra = if final_text.starts_with(&split.raw) {
+        &final_text[split.raw.len()..]
+    } else if split.raw.is_empty() {
+        final_text
+    } else {
+        return reconcile_response_text(text_open, text, final_text);
+    };
+    reply_events(split.push(extra), text_open, text, thinking_open)
+}
+
+fn reply_events(
+    pieces: Vec<ReplyPiece>,
+    text_open: &mut bool,
+    text: &mut String,
+    thinking_open: &mut bool,
+) -> Vec<ModelEvent> {
+    let mut events = Vec::new();
+    for piece in pieces {
+        match piece {
+            ReplyPiece::Thinking(chunk) => {
+                if *text_open {
+                    *text_open = false;
+                    events.push(ModelEvent::TextEnd);
+                }
+                if !*thinking_open {
+                    *thinking_open = true;
+                    events.push(ModelEvent::ThinkingStart);
+                }
+                events.push(ModelEvent::ThinkingDelta(chunk));
+            }
+            ReplyPiece::Answer(chunk) => {
+                if *thinking_open {
+                    *thinking_open = false;
+                    events.push(ModelEvent::ThinkingEnd);
+                }
+                if !*text_open {
+                    *text_open = true;
+                    events.push(ModelEvent::TextStart);
+                }
+                text.push_str(&chunk);
+                events.push(ModelEvent::TextDelta(chunk));
+            }
+        }
+    }
+    events
+}
+
+fn could_be_thinking_heading(text: &str) -> bool {
+    let head = heading_line(text).to_ascii_lowercase();
+    let head = head.trim_end_matches(':').trim();
+    "thinking process".starts_with(head) || head.starts_with("thinking process")
+}
+
+fn is_thinking_heading(text: &str) -> bool {
+    heading_line(text)
+        .trim_end_matches(':')
+        .trim()
+        .eq_ignore_ascii_case("thinking process")
+}
+
+fn heading_line(text: &str) -> &str {
+    text.trim_start()
+        .trim_start_matches('#')
+        .trim_start()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+}
+
+fn is_thinking_continuation(line: &str) -> bool {
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return true;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || lower.starts_with("wait")
+        || lower.starts_with("let's")
+        || lower.starts_with("lets ")
+        || lower.starts_with("first")
+}
+
+fn answer_boundary(text: &str, allow_incomplete_line: bool) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("\n\n") {
+        let at = search + rel;
+        let rest = &text[at + 2..];
+        let line = rest.lines().next().unwrap_or("");
+        if line.is_empty() {
+            search = at + 2;
+            continue;
+        }
+        if !allow_incomplete_line && !rest.contains('\n') {
+            return None;
+        }
+        if is_thinking_continuation(line) {
+            search = at + 2;
+            continue;
+        }
+        return Some(at + 2);
+    }
+    None
+}
+
+fn thinking_holdback(text: &str, force: bool) -> usize {
+    if force {
+        return 0;
+    }
+    if let Some(at) = text.rfind("\n\n") {
+        return text.len() - at;
+    }
+    if text.ends_with('\n') {
+        1
+    } else {
+        0
     }
 }
 
@@ -764,6 +1015,40 @@ mod tests {
     use super::*;
     use crate::model::{ModelSpec, ProviderReplayState};
     use crate::provider::ModelEvent;
+
+    #[test]
+    fn thinking_process_prefix_becomes_thought_and_the_answer_stays_text() {
+        let mut split = ReplySplit::default();
+        let mut events = split.push("Thinking Process:\n1. Look at the file.\n\n");
+        events.extend(split.push("可以开始改了。"));
+        events.extend(split.finish());
+        let thinking = events
+            .iter()
+            .filter_map(|piece| match piece {
+                ReplyPiece::Thinking(text) => Some(text.as_str()),
+                ReplyPiece::Answer(_) => None,
+            })
+            .collect::<String>();
+        let answer = events
+            .iter()
+            .filter_map(|piece| match piece {
+                ReplyPiece::Answer(text) => Some(text.as_str()),
+                ReplyPiece::Thinking(_) => None,
+            })
+            .collect::<String>();
+        assert!(thinking.contains("Thinking Process"));
+        assert!(thinking.contains("Look at the file"));
+        assert_eq!(answer, "可以开始改了。");
+    }
+
+    #[test]
+    fn ordinary_reply_stays_answer_text() {
+        let mut split = ReplySplit::default();
+        let events = split.push("你好！有什么需要我帮忙的？");
+        assert!(
+            matches!(events.as_slice(), [ReplyPiece::Answer(text)] if text == "你好！有什么需要我帮忙的？")
+        );
+    }
 
     #[test]
     fn completed_response_output_keeps_reasoning_summary() {

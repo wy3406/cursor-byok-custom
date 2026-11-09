@@ -40,8 +40,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/heads/main')
         with:
-          tag_name: v1.0.18-custom
-          name: "Cursor BYOK Custom v1.0.18 (invocation id)"
+          tag_name: v1.0.19-custom
+          name: "Cursor BYOK Custom v1.0.19 (thought text)"
           draft: false
           prerelease: false
           files: target/release/cursor-byok-desktop.exe
