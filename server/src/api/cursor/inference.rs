@@ -140,7 +140,7 @@ pub async fn project_prompt(
     let mut history = Vec::new();
     for (index, message) in request.messages.iter().enumerate() {
         if let Some(inference_core_message::Content::ToolContent(content)) = &message.content {
-            push_tool_results(&mut history, index, content);
+            push_tool_results(&mut history, index, content).await?;
             continue;
         }
         if message.role == ROLE_ASSISTANT && !message.tool_calls.is_empty() {
@@ -212,12 +212,18 @@ fn project_tools(tools: &[InferenceAgentTool]) -> Vec<ToolDefinition> {
         .collect()
 }
 
-fn push_tool_results(
+async fn push_tool_results(
     history: &mut Vec<ProjectedMessage>,
     index: usize,
     content: &InferenceToolResultContent,
-) {
+) -> Result<()> {
     for (part_index, part) in content.parts.iter().enumerate() {
+        let mut provider_parts = Vec::new();
+        for content in &part.experimental_content {
+            if let Some(decoded) = content_part(content).await? {
+                provider_parts.push(decoded);
+            }
+        }
         history.push(ProjectedMessage {
             message_id: format!("inference-{index}-{part_index}"),
             role: Role::Tool,
@@ -227,10 +233,11 @@ fn push_tool_results(
                 content: value_text(&part.result),
                 is_error: part.is_error,
                 image: None,
-                provider_parts: Vec::new(),
+                provider_parts,
             }),
         });
     }
+    Ok(())
 }
 
 fn assistant_with_calls(

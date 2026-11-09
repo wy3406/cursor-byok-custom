@@ -141,6 +141,7 @@ message InferenceToolResultPart {
   // length-delimited wire type, so the value is decoded after the message.
   bytes result = 3;
   bool is_error = 4;
+  repeated InferenceContentPart experimental_content = 5;
 }
 
 message RunInferenceServerMessage {

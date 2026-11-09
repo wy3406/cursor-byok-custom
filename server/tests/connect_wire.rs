@@ -309,6 +309,14 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
                             tool_name: "lookup".into(),
                             result: length_delimited(3, b"tool-out"),
                             is_error: false,
+                            experimental_content: vec![inf::InferenceContentPart {
+                                part: Some(inf::inference_content_part::Part::Image(
+                                    inf::InferenceImagePart {
+                                        data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==".into(),
+                                        mime_type: "image/png".into(),
+                                    },
+                                )),
+                            }],
                         }],
                     },
                 )),
@@ -410,6 +418,13 @@ async fn inference_prompt_keeps_user_text_and_tool_result() {
     assert!(history_text(&projected.history[0]).contains("status-check"));
     assert!(history_text(&projected.history[1]).contains("tool-out"));
     assert!(!history_text(&projected.history[1]).contains("fallback"));
+    let cursor_server::model::ProjectedContent::ToolResult(result) = &projected.history[1].content
+    else {
+        panic!("expected a tool result");
+    };
+    assert!(result.provider_parts.iter().any(|part| {
+        matches!(part, cursor_server::model::ContentPart::Image { mime_type, .. } if mime_type == "image/png")
+    }));
 }
 
 #[tokio::test]
