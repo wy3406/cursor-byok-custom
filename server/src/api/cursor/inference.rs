@@ -29,13 +29,13 @@ use crate::{
                 run_inference_client_message, run_inference_server_message, InferenceAgentTool,
                 InferenceContentPart, InferenceCoreMessage, InferenceInvocationIdInfo,
                 InferenceModelParameterValue, InferenceStreamRequest, InferenceStreamResponse,
-                InferenceTextStreamPart,
-                InferenceThinkingStreamPart, InferenceToolCall, InferenceToolCallStreamPart,
-                InferenceToolResultContent, RunInferenceCompressedRequest, RunInferenceHeartbeat,
-                RunInferenceInvocationEnd, RunInferenceInvocationError,
-                RunInferenceInvocationResponse, RunInferenceInvokeModel,
-                RunInferencePromptModelMetadata, RunInferenceRoutingMessage, RunInferenceRunReady,
-                RunInferenceRunRequest, RunInferenceServerMessage,
+                InferenceTextStreamPart, InferenceThinkingStreamPart, InferenceToolCall,
+                InferenceToolCallStreamPart, InferenceToolResultContent,
+                RunInferenceCompressedRequest, RunInferenceHeartbeat, RunInferenceInvocationEnd,
+                RunInferenceInvocationError, RunInferenceInvocationResponse,
+                RunInferenceInvokeModel, RunInferencePromptModelMetadata,
+                RunInferenceRoutingMessage, RunInferenceRunReady, RunInferenceRunRequest,
+                RunInferenceServerMessage,
             },
         },
         transport::{TransportHandle, TransportParent, TransportRegistry},
@@ -1385,18 +1385,16 @@ fn invocation_id_part(invocation_id: &str) -> Option<RunInferenceServerMessage> 
         return None;
     }
     Some(server(
-        run_inference_server_message::Message::InvocationResponse(
-            RunInferenceInvocationResponse {
-                invocation_id: invocation_id.to_owned(),
-                response: Some(InferenceStreamResponse {
-                    response: Some(inference_stream_response::Response::InvocationId(
-                        InferenceInvocationIdInfo {
-                            invocation_id: invocation_id.to_owned(),
-                        },
-                    )),
-                }),
-            },
-        ),
+        run_inference_server_message::Message::InvocationResponse(RunInferenceInvocationResponse {
+            invocation_id: invocation_id.to_owned(),
+            response: Some(InferenceStreamResponse {
+                response: Some(inference_stream_response::Response::InvocationId(
+                    InferenceInvocationIdInfo {
+                        invocation_id: invocation_id.to_owned(),
+                    },
+                )),
+            }),
+        }),
     ))
 }
 
