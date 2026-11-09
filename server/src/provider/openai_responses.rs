@@ -72,8 +72,7 @@ impl Provider for OpenAiResponsesProvider {
             let input = responses_input(&request.history)?;
             let mut body = json!({
                 "model": request.model.model_id, "input": input, "stream": true,
-                "instructions": request.prompt.instructions,
-                "include": ["reasoning.encrypted_content"]
+                "instructions": request.prompt.instructions
             });
             if !request.prompt.tools.is_empty() {
                 body["tools"] = json!(request.prompt.tools.iter().map(|tool| json!({
