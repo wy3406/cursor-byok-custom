@@ -3,7 +3,7 @@
 //! The local loop's first append is a RunInferenceClientMessage. Its run
 //! request carries a conversation id string, not a ConversationStateStructure.
 //! Replies on the open RunInferenceSSE stream are RunInferenceServerMessage
-//! frames: run_ready, then invocation text, then invocation_end.
+//! frames: run_ready, then invocation text, the turn id, then invocation_end.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -27,8 +27,9 @@ use crate::{
             proto::inference::v1::{
                 inference_content_part, inference_core_message, inference_stream_response,
                 run_inference_client_message, run_inference_server_message, InferenceAgentTool,
-                InferenceContentPart, InferenceCoreMessage, InferenceModelParameterValue,
-                InferenceStreamRequest, InferenceStreamResponse, InferenceTextStreamPart,
+                InferenceContentPart, InferenceCoreMessage, InferenceInvocationIdInfo,
+                InferenceModelParameterValue, InferenceStreamRequest, InferenceStreamResponse,
+                InferenceTextStreamPart,
                 InferenceThinkingStreamPart, InferenceToolCall, InferenceToolCallStreamPart,
                 InferenceToolResultContent, RunInferenceCompressedRequest, RunInferenceHeartbeat,
                 RunInferenceInvocationEnd, RunInferenceInvocationError,
@@ -1379,7 +1380,30 @@ fn emit_thinking(
     )
 }
 
+fn invocation_id_part(invocation_id: &str) -> Option<RunInferenceServerMessage> {
+    if invocation_id.is_empty() {
+        return None;
+    }
+    Some(server(
+        run_inference_server_message::Message::InvocationResponse(
+            RunInferenceInvocationResponse {
+                invocation_id: invocation_id.to_owned(),
+                response: Some(InferenceStreamResponse {
+                    response: Some(inference_stream_response::Response::InvocationId(
+                        InferenceInvocationIdInfo {
+                            invocation_id: invocation_id.to_owned(),
+                        },
+                    )),
+                }),
+            },
+        ),
+    ))
+}
+
 fn emit_end(handle: &TransportHandle, invocation_id: &str, error: Option<String>) -> Result<()> {
+    if let Some(message) = invocation_id_part(invocation_id) {
+        emit(handle, &message)?;
+    }
     emit(
         handle,
         &server(run_inference_server_message::Message::InvocationEnd(
@@ -1472,5 +1496,36 @@ mod tests {
         );
         assert_eq!(spec.reasoning.effort.as_deref(), Some("medium"));
         assert!(spec.reasoning.enabled);
+    }
+
+    #[test]
+    fn invocation_id_part_uses_stream_field_seven() {
+        use crate::cursor::protocol::proto::inference::v1::{
+            inference_stream_response, RunInferenceServerMessage,
+        };
+
+        let id = "6d7f4d93-82cc-4900-beca-03052dc6961c-0-sumr";
+        let message = super::invocation_id_part(id).unwrap();
+        let bytes = encode(&message);
+        let decoded = RunInferenceServerMessage::decode(bytes.as_slice()).unwrap();
+        let response = match decoded.message {
+            Some(
+                crate::cursor::protocol::proto::inference::v1::run_inference_server_message::Message::InvocationResponse(response),
+            ) => response,
+            other => panic!("expected invocation response, got {other:?}"),
+        };
+        assert_eq!(response.invocation_id, id);
+        let stream = response.response.expect("stream response");
+        let encoded_stream = encode(&stream);
+        assert_eq!(encoded_stream[0], 0x3a, "field 7, length-delimited");
+        match stream.response {
+            Some(inference_stream_response::Response::InvocationId(info)) => {
+                assert_eq!(info.invocation_id, id);
+                let inner = encode(&info);
+                assert_eq!(inner[0], 0x0a, "inner field 1, length-delimited");
+            }
+            other => panic!("expected invocation id part, got {other:?}"),
+        }
+        assert!(super::invocation_id_part("").is_none());
     }
 }

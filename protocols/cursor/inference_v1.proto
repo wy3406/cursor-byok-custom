@@ -210,10 +210,15 @@ message InferenceToolCallStreamPart {
   int32 tool_index = 5;
 }
 
+message InferenceInvocationIdInfo {
+  string invocation_id = 1;
+}
+
 message InferenceStreamResponse {
   oneof response {
     InferenceTextStreamPart text_part = 1;
     InferenceToolCallStreamPart tool_call_part = 2;
+    InferenceInvocationIdInfo invocation_id = 7;
     InferenceThinkingStreamPart thinking_part = 9;
   }
 }
