@@ -1,4 +1,4 @@
-name: Build Windows Release
+name: Build Desktop Release
 
 on:
   push:
@@ -11,8 +11,25 @@ permissions:
 
 jobs:
   build:
-    name: Build cursor-byok Windows Binary
-    runs-on: windows-latest
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            source: target/release/cursor-byok-desktop.exe
+            asset: cursor-byok-desktop.exe
+          - os: ubuntu-22.04
+            label: linux
+            source: target/release/cursor-byok-desktop
+            asset: cursor-byok-desktop-linux
+          - os: macos-latest
+            label: macos
+            source: target/release/cursor-byok-desktop
+            asset: cursor-byok-desktop-macos
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,26 +41,48 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux system dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
       - name: Install dependencies and build desktop app
         working-directory: apps/desktop
         run: |
           npm ci
           npm run tauri:build -- --no-bundle --features custom-protocol
 
+      - name: Name the downloadable binary
+        shell: bash
+        run: cp "${{ matrix.source }}" "${{ matrix.asset }}"
+
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cursor-byok-desktop-windows
-          path: target/release/cursor-byok-desktop.exe
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: Publish desktop release
+    needs: build
+    if: startsWith(github.ref, 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/heads/main')
         with:
-          tag_name: v1.0.19-custom
-          name: "Cursor BYOK Custom v1.0.19 (thought text)"
+          tag_name: v1.0.20-custom
+          name: "Cursor BYOK Custom v1.0.20 (linux and mac)"
           draft: false
           prerelease: false
-          files: target/release/cursor-byok-desktop.exe
+          files: |
+            dist/cursor-byok-desktop.exe/cursor-byok-desktop.exe
+            dist/cursor-byok-desktop-linux/cursor-byok-desktop-linux
+            dist/cursor-byok-desktop-macos/cursor-byok-desktop-macos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
