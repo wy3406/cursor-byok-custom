@@ -117,7 +117,10 @@ pub async fn accept(
         run_inference_client_message::Message::InvokeModel(invoke) => {
             start_invocation(registry, &handle, invoke).await
         }
-        run_inference_client_message::Message::ClientHeartbeat(_) => emit_heartbeat(&handle),
+        run_inference_client_message::Message::ClientHeartbeat(_) => {
+            let _delivered = emit_heartbeat(&handle)?;
+            Ok(())
+        }
         run_inference_client_message::Message::CancelInvocation(_) => {
             cancel_generation(request_id).await;
             Ok(())
@@ -898,7 +901,7 @@ async fn open_run(
             None => local_prompt_metadata(None, "", &model_id),
         }
     };
-    emit(
+    if !emit(
         handle,
         &server(run_inference_server_message::Message::RunReady(
             RunInferenceRunReady {
@@ -907,7 +910,9 @@ async fn open_run(
                 accepts_client_heartbeat: true,
             },
         )),
-    )?;
+    )? {
+        return Err(Error::RunNotFound(handle.request_id().to_owned()));
+    }
     spawn_heartbeats(handle.clone(), heartbeats);
     tracing::info!(
         request_id = handle.request_id(),
@@ -984,12 +989,14 @@ async fn start_invocation(
         if let Err(error) =
             stream_invocation(&handle, &invocation_id, provider, invocation, cancel).await
         {
-            tracing::warn!(
-                request_id = handle.request_id(),
-                %error,
-                "inference invocation failed"
-            );
-            let _ = emit_end(&handle, &invocation_id, Some(error.to_string()));
+            if report_invocation_failure(&error) {
+                tracing::warn!(
+                    request_id = handle.request_id(),
+                    %error,
+                    "inference invocation failed"
+                );
+                let _ = emit_end(&handle, &invocation_id, Some(error.to_string()));
+            }
         }
     });
     Ok(())
@@ -1011,7 +1018,9 @@ async fn stream_invocation(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
+                if !close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)? {
+                    return Ok(());
+                }
                 emit_end(handle, invocation_id, None)?;
                 return Ok(());
             }
@@ -1022,14 +1031,25 @@ async fn stream_invocation(
                 match event? {
                     ModelEvent::TextDelta(text) if !text.is_empty() => {
                         saw_text = true;
-                        emit_text(handle, invocation_id, &text, false)?;
+                        if !emit_text(handle, invocation_id, &text, false)? {
+                            return Ok(());
+                        }
                     }
                     ModelEvent::ThinkingDelta(text) if !text.is_empty() => {
                         saw_thinking = true;
-                        emit_thinking(handle, invocation_id, &text, false)?;
+                        if !emit_thinking(handle, invocation_id, &text, false)? {
+                            return Ok(());
+                        }
                     }
                     ModelEvent::ThinkingEnd => {
-                        close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
+                        if !close_thinking(
+                            handle,
+                            invocation_id,
+                            saw_thinking,
+                            &mut thinking_closed,
+                        )? {
+                            return Ok(());
+                        }
                     }
                     ModelEvent::ToolCallStart { index, call_id, name } => {
                         let call = open_tools.entry(index).or_default();
@@ -1041,7 +1061,9 @@ async fn stream_invocation(
                     }
                     ModelEvent::ToolCallEnd { index } => {
                         let call = open_tools.remove(&index).unwrap_or_default();
-                        emit_tool_call(handle, invocation_id, index, &call)?;
+                        if !emit_tool_call(handle, invocation_id, index, &call)? {
+                            return Ok(());
+                        }
                         saw_tool = true;
                     }
                     ModelEvent::Done(_) => break,
@@ -1051,17 +1073,21 @@ async fn stream_invocation(
         }
     }
     for (index, call) in open_tools {
-        emit_tool_call(handle, invocation_id, index, &call)?;
+        if !emit_tool_call(handle, invocation_id, index, &call)? {
+            return Ok(());
+        }
         saw_tool = true;
     }
-    close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)?;
+    if !close_thinking(handle, invocation_id, saw_thinking, &mut thinking_closed)? {
+        return Ok(());
+    }
     if !saw_text && !saw_tool && !saw_thinking {
         return Err(Error::Provider(
             "inference provider returned no text".into(),
         ));
     }
-    if saw_text {
-        emit_text(handle, invocation_id, "", true)?;
+    if saw_text && !emit_text(handle, invocation_id, "", true)? {
+        return Ok(());
     }
     emit_end(handle, invocation_id, None)
 }
@@ -1265,7 +1291,7 @@ fn spawn_heartbeats(handle: TransportHandle, cancel: CancellationToken) {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    if emit_heartbeat(&handle).is_err() {
+                    if !emit_heartbeat(&handle).unwrap_or(false) {
                         break;
                     }
                 }
@@ -1274,7 +1300,7 @@ fn spawn_heartbeats(handle: TransportHandle, cancel: CancellationToken) {
     });
 }
 
-fn emit_heartbeat(handle: &TransportHandle) -> Result<()> {
+fn emit_heartbeat(handle: &TransportHandle) -> Result<bool> {
     emit(
         handle,
         &server(run_inference_server_message::Message::Heartbeat(
@@ -1297,7 +1323,7 @@ fn emit_tool_call(
     invocation_id: &str,
     index: usize,
     call: &OpenToolCall,
-) -> Result<()> {
+) -> Result<bool> {
     emit(
         handle,
         &server(run_inference_server_message::Message::InvocationResponse(
@@ -1324,7 +1350,7 @@ fn emit_text(
     invocation_id: &str,
     text: &str,
     is_final: bool,
-) -> Result<()> {
+) -> Result<bool> {
     emit(
         handle,
         &server(run_inference_server_message::Message::InvocationResponse(
@@ -1348,12 +1374,14 @@ fn close_thinking(
     invocation_id: &str,
     saw_thinking: bool,
     thinking_closed: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
     if saw_thinking && !*thinking_closed {
-        emit_thinking(handle, invocation_id, "", true)?;
+        if !emit_thinking(handle, invocation_id, "", true)? {
+            return Ok(false);
+        }
         *thinking_closed = true;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn emit_thinking(
@@ -1361,7 +1389,7 @@ fn emit_thinking(
     invocation_id: &str,
     text: &str,
     is_final: bool,
-) -> Result<()> {
+) -> Result<bool> {
     emit(
         handle,
         &server(run_inference_server_message::Message::InvocationResponse(
@@ -1400,9 +1428,11 @@ fn invocation_id_part(invocation_id: &str) -> Option<RunInferenceServerMessage> 
 
 fn emit_end(handle: &TransportHandle, invocation_id: &str, error: Option<String>) -> Result<()> {
     if let Some(message) = invocation_id_part(invocation_id) {
-        emit(handle, &message)?;
+        if !emit(handle, &message)? {
+            return Ok(());
+        }
     }
-    emit(
+    let _delivered = emit(
         handle,
         &server(run_inference_server_message::Message::InvocationEnd(
             RunInferenceInvocationEnd {
@@ -1410,7 +1440,8 @@ fn emit_end(handle: &TransportHandle, invocation_id: &str, error: Option<String>
                 error: error.map(|message| RunInferenceInvocationError { code: 2, message }),
             },
         )),
-    )
+    )?;
+    Ok(())
 }
 
 fn server(message: run_inference_server_message::Message) -> RunInferenceServerMessage {
@@ -1419,13 +1450,15 @@ fn server(message: run_inference_server_message::Message) -> RunInferenceServerM
     }
 }
 
-fn emit(handle: &TransportHandle, message: &RunInferenceServerMessage) -> Result<()> {
+fn report_invocation_failure(error: &Error) -> bool {
+    !matches!(error, Error::RunNotFound(_))
+}
+
+fn emit(handle: &TransportHandle, message: &RunInferenceServerMessage) -> Result<bool> {
     let frame = connect::encode_message(message)?;
-    if handle.emit_frame(frame) {
-        Ok(())
-    } else {
-        Err(Error::RunNotFound(handle.request_id().to_owned()))
-    }
+    // The output hub is closed only after the run has already finished. A later
+    // provider frame has no listener, so the invocation stops instead of failing.
+    Ok(handle.emit_frame(frame))
 }
 
 #[cfg(test)]
@@ -1525,5 +1558,35 @@ mod tests {
             other => panic!("expected invocation id part, got {other:?}"),
         }
         assert!(super::invocation_id_part("").is_none());
+    }
+
+    #[test]
+    fn a_frame_after_the_run_closed_does_not_fail_the_turn() {
+        use std::sync::Arc;
+
+        use crate::cursor::{
+            services::observability::CursorTraceRecorder,
+            transport::{OutputHub, TransportHandle},
+        };
+
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let output = Arc::new(OutputHub::default());
+        let request_id = "828961a8-3ec1-4b17-9d13-4e2bf59d62ae";
+        let handle = TransportHandle::new(
+            request_id.into(),
+            commands,
+            Arc::clone(&output),
+            CursorTraceRecorder::detached(request_id),
+        );
+        assert!(super::emit_text(&handle, "invocation", "hello", false).unwrap());
+        assert!(output.close());
+        assert!(!super::emit_text(&handle, "invocation", "late", false).unwrap());
+        super::emit_end(&handle, "invocation", None).unwrap();
+        assert!(!super::report_invocation_failure(
+            &crate::Error::RunNotFound(request_id.into())
+        ));
+        assert!(super::report_invocation_failure(&crate::Error::Provider(
+            "inference provider returned no text".into()
+        )));
     }
 }

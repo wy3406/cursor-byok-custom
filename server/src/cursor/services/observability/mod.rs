@@ -52,6 +52,17 @@ impl CursorTraceRecorder {
         &self.request_id
     }
 
+    #[cfg(test)]
+    pub fn detached(request_id: &str) -> Self {
+        let (sender, _receiver) = mpsc::channel(1);
+        Self {
+            request_id: Arc::from(request_id),
+            sender,
+            finished: Arc::new(AtomicBool::new(false)),
+            activation: Arc::new(AtomicU8::new(TRACE_UNKNOWN)),
+        }
+    }
+
     pub fn begin(&self, conversation_id: Option<&str>, route: &str, model_id: Option<&str>) {
         self.send_control(TraceEvent::Begin {
             request_id: self.request_id.to_string(),

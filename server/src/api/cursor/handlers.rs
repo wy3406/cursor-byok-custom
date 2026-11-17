@@ -1,4 +1,6 @@
 //! Implements Cursor HTTP endpoints outside the Agent Run stream.
+use std::time::Duration;
+
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{DefaultBodyLimit, Extension, State},
@@ -23,7 +25,7 @@ use crate::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
             knowledge, model_catalog, server_config, tab,
         },
-        transport::{TransportParent, TransportRegistry},
+        transport::{TransportParent, TransportRegistry, TransportRoute},
     },
     Result,
 };
@@ -292,15 +294,18 @@ async fn bidi_handler(
     } else if registry.upstream(decoded.request_id()).await {
         false
     } else {
-        trace.resume();
-        trace.request(
-            "bidi_request",
-            body.clone(),
-            trace_outcome(trace_metadata, false, "missing_transport", None),
-        );
-        return Err(crate::Error::Protocol(
-            "first BidiAppend message must select a model".into(),
-        ));
+        match route_model_less_append(&registry, decoded.request_id(), MODEL_SELECTION_WAIT).await {
+            Ok(local) => local,
+            Err(error) => {
+                trace.resume();
+                trace.request(
+                    "bidi_request",
+                    body.clone(),
+                    trace_outcome(trace_metadata, false, "missing_transport", None),
+                );
+                return Err(error);
+            }
+        }
     };
     if first_model.is_some() {
         trace.begin(
@@ -406,6 +411,22 @@ fn trace_outcome(
     metadata
 }
 
+const MODEL_SELECTION_WAIT: Duration = Duration::from_secs(5);
+
+async fn route_model_less_append(
+    registry: &TransportRegistry,
+    request_id: &str,
+    wait: Duration,
+) -> Result<bool> {
+    match tokio::time::timeout(wait, registry.wait_route(request_id)).await {
+        Ok(TransportRoute::Local) => Ok(true),
+        Ok(TransportRoute::Upstream(_)) => Ok(false),
+        Err(_) => Err(crate::Error::Protocol(
+            "first BidiAppend message must select a model".into(),
+        )),
+    }
+}
+
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, usize::MAX)
@@ -435,4 +456,86 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>
         .map(|value| value.to_str())
         .transpose()
         .map_err(|error| crate::Error::Protocol(format!("invalid {name} header: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        cursor::{
+            prompting::{PromptAssets, PromptCompiler},
+            transport::TransportRegistry,
+        },
+        model::ModelInvocation,
+        provider::{ModelEvent, Provider, ProviderStream},
+        store::Store,
+        Error,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct SilentProvider;
+
+    impl Provider for SilentProvider {
+        fn stream(
+            &self,
+            _invocation: ModelInvocation,
+            _cancellation: CancellationToken,
+        ) -> ProviderStream {
+            Box::pin(futures_util::stream::empty::<Result<ModelEvent, Error>>())
+        }
+    }
+
+    async fn registry() -> (tempfile::TempDir, TransportRegistry) {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("bidi-route.db").display()
+        );
+        let store = Store::connect(&url).await.unwrap();
+        let registry = TransportRegistry::new(
+            store,
+            Arc::new(SilentProvider),
+            PromptCompiler::new(PromptAssets::embedded().unwrap()),
+        );
+        (directory, registry)
+    }
+
+    #[tokio::test]
+    async fn a_model_less_append_waits_for_the_model_route() {
+        let (_directory, registry) = registry().await;
+        let registry_for_wait = registry.clone();
+        let waiter = tokio::spawn(async move {
+            super::route_model_less_append(&registry_for_wait, "request-1", Duration::from_secs(2))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        registry.mark_upstream("request-1").await;
+        let local = waiter.await.unwrap().unwrap();
+        assert!(!local);
+    }
+
+    #[tokio::test]
+    async fn a_model_less_append_uses_an_existing_local_run() {
+        let (_directory, registry) = registry().await;
+        registry.get_or_create("request-local").await.unwrap();
+        let local =
+            super::route_model_less_append(&registry, "request-local", Duration::from_millis(20))
+                .await
+                .unwrap();
+        assert!(local);
+    }
+
+    #[tokio::test]
+    async fn a_model_less_append_ends_when_no_model_arrives() {
+        let (_directory, registry) = registry().await;
+        let error =
+            super::route_model_less_append(&registry, "request-missing", Duration::from_millis(30))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, Error::Protocol(ref message) if message.contains("must select a model")),
+            "{error}"
+        );
+    }
 }

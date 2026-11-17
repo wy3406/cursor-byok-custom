@@ -76,8 +76,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.20-custom
-          name: "Cursor BYOK Custom v1.0.20 (linux and mac)"
+          tag_name: v1.0.21-custom
+          name: "Cursor BYOK Custom v1.0.21"
           draft: false
           prerelease: false
           files: |
