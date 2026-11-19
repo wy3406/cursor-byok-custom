@@ -1,4 +1,4 @@
-//! Sends one Provider HTTP attempt without applying retry policy.
+//! Sends one provider HTTP request and keeps the connection-layer cause.
 
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,16 @@ where
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Ok(Attempt::Cancelled),
         response = build().send() => response,
-    }?;
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(Error::Provider(format!(
+                "{label}: {}",
+                transport_detail(&error)
+            )));
+        }
+    };
     if let Some(recorder) = recorder {
         recorder
             .response_headers(response.status().as_u16())
@@ -44,10 +53,28 @@ where
     )))
 }
 
+fn transport_detail(error: &reqwest::Error) -> String {
+    let mut detail = error.to_string();
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    while let Some(source) = current.source() {
+        let text = source.to_string();
+        if !detail.contains(&text) {
+            detail.push_str(": ");
+            detail.push_str(&text);
+        }
+        current = source;
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn local_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
 
     async fn server(response: &'static [u8]) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -65,7 +92,7 @@ mod tests {
     async fn non_success_status_is_one_failed_attempt() {
         let url =
             server(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\ndown").await;
-        let client = reqwest::Client::new();
+        let client = local_client();
         let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
             .await
             .unwrap_err();
@@ -78,7 +105,7 @@ mod tests {
     async fn response_body_transport_failure_is_one_failed_attempt() {
         let url =
             server(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\nshort").await;
-        let client = reqwest::Client::new();
+        let client = local_client();
         let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
             .await
             .unwrap_err();
@@ -86,15 +113,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_transport_failure_is_one_failed_attempt() {
+    async fn request_transport_failure_reports_the_connection_cause() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
         let url = format!("http://{address}");
-        let client = reqwest::Client::new();
+        let client = local_client();
         let error = send_once("test", || client.get(&url), &CancellationToken::new(), None)
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Http(_)));
+        let Error::Provider(message) = error else {
+            panic!("expected the connection cause");
+        };
+        assert!(message.starts_with("test: "), "{message}");
+        assert!(
+            message.contains("error sending request") || message.contains("connection"),
+            "{message}"
+        );
     }
 }
