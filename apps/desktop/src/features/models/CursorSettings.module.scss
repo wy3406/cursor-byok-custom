@@ -19,6 +19,20 @@
   white-space: nowrap;
 }
 
+.reconnect {
+  height: 25px;
+  padding: 0 8px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 5px;
+  font-size: type.$font-size-xs;
+  white-space: nowrap;
+
+  &:hover:not(:disabled) { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+  &:disabled { opacity: 0.55; }
+}
+
 .groupActions {
   display: flex;
   align-items: center;

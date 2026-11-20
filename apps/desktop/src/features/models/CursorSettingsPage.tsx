@@ -275,6 +275,23 @@ export function CursorSettingsPage() {
     onGroupSettings={openGroupSettings}
   />;
 
+  const enableTakeover = async () => {
+    await appStore.setCursorEnabled(true);
+    if (appStore.getSnapshot().error) return;
+    message(t("已写入代理设置。已经打开且尚未加载代理的 Cursor 窗口，需要重新加载后才会使用。"), { duration: 6000 });
+  };
+  const reconnectProxy = async () => {
+    const result = await appStore.reconnectCursor();
+    if (!result) {
+      message(appStore.getSnapshot().error ?? t("重新接上失败"));
+      return;
+    }
+    if (result.portChanged && result.proxyUrl) {
+      message(t("原端口被占用，代理已改到 {url}。请重新加载 Cursor 窗口。", { url: result.proxyUrl }), { duration: 6000 });
+      return;
+    }
+    message(t("代理已重新接上"));
+  };
   const refreshCa = async () => {
     await appStore.refresh();
     if (appStore.getSnapshot().cursorHarness?.ca !== "ready") setWaitingForCaRefresh(false);
@@ -310,11 +327,14 @@ export function CursorSettingsPage() {
             disabled={cursorBusy || (!cursorTakenOver && !caReady)}
             label={takeoverLabel}
             onChange={(enabled) => {
-              if (enabled) void appStore.setCursorEnabled(true);
+              if (enabled) void enableTakeover();
               else setConfirmDisableTakeover(true);
             }}
           />
         </TooltipTrigger>
+        {cursorTakenOver && <TooltipTrigger label={t("重新绑定本地代理。端口不变时不关闭 Cursor。")}>
+          <button type="button" className={styles.reconnect} disabled={cursorBusy} onClick={() => void reconnectProxy()}>{t("重新接上")}</button>
+        </TooltipTrigger>}
         {testTargets.length > 0 && <div className={styles.groupActions} role="group" aria-label={t("操作")}>
           <button type="button" aria-pressed={grouping === "flat"} onClick={() => setGrouping("flat")}>{t("默认平铺")}</button>
           {canGroupByProvider && <button type="button" aria-pressed={grouping === "provider"} onClick={() => setGrouping("provider")}>{t("按供应商")}</button>}

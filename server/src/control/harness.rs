@@ -26,3 +26,7 @@ pub async fn set_enabled(
         service.cursor_harness().set_enabled(input.enabled).await?,
     ))
 }
+
+pub async fn reconnect(State(service): State<ControlService>) -> Result<Json<CursorHarnessStatus>> {
+    Ok(Json(service.cursor_harness().reconnect().await?))
+}

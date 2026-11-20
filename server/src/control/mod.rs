@@ -236,6 +236,10 @@ pub fn api_router(service: ControlService) -> Router {
             "/__byok-api__/api/harness/cursor/enabled",
             put(harness::set_enabled),
         )
+        .route(
+            "/__byok-api__/api/harness/cursor/reconnect",
+            post(harness::reconnect),
+        )
         .with_state(service)
         .layer(desktop_cors())
 }

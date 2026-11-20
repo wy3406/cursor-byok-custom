@@ -1,7 +1,6 @@
 //! Exposes the local desktop application integration.
 mod account;
 mod ca;
-mod process;
 mod proxy;
 mod settings;
 
@@ -163,6 +162,15 @@ impl CursorHarness {
         self.status().await
     }
 
+    pub async fn reconnect(&self) -> Result<CursorHarnessStatus> {
+        if !self.inner.store.cursor_takeover_enabled().await? {
+            return Err(Error::Config("Cursor takeover is off".into()));
+        }
+        self.inner.proxy.lock().await.stop().await;
+        self.enable().await?;
+        self.status().await
+    }
+
     pub async fn set_tab_settings(&self, settings: TabSettings) -> Result<TabSettings> {
         let saved = self.inner.store.set_tab_settings(settings).await?;
         *self.inner.tab_mode.write() = saved.mode;
@@ -181,19 +189,6 @@ impl CursorHarness {
             .read()
             .ok_or_else(|| Error::Config("desktop management server is not ready".into()))?;
         let mut proxy = self.inner.proxy.lock().await;
-        let settings_applied = proxy
-            .url()
-            .as_deref()
-            .map(settings::settings_match)
-            .transpose()?
-            .unwrap_or(false);
-        if !settings_applied {
-            // Terminating Cursor only makes the freshly written http.proxy take effect
-            // sooner; it is optional, so a failed probe or kill must not block takeover.
-            if let Err(error) = process::terminate_cursor().await {
-                tracing::warn!(%error, "could not terminate Cursor before applying proxy settings");
-            }
-        }
         if proxy.running() {
             if let Some(url) = proxy.url() {
                 apply_cursor_configuration(&url).await?;

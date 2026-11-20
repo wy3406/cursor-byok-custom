@@ -178,6 +178,19 @@ export const appStore = {
     catch (cause) { update({ error: cause instanceof Error ? cause.message : String(cause) }); }
     finally { update({ cursorBusy: false }); }
   },
+  async reconnectCursor() {
+    const previousPort = snapshot.ports.proxy_port;
+    update({ cursorBusy: true, error: null });
+    try {
+      const cursorHarness = await api.reconnectCursor();
+      const ports = await api.ports();
+      update({ cursorHarness, ports });
+      return { proxyUrl: cursorHarness.proxy_url, portChanged: ports.proxy_port !== previousPort };
+    } catch (cause) {
+      update({ error: cause instanceof Error ? cause.message : String(cause) });
+      return null;
+    } finally { update({ cursorBusy: false }); }
+  },
   async createModels(models: ModelInput[]) {
     update({ cursorBusy: true, error: null });
     try {
