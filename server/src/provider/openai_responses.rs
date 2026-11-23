@@ -26,6 +26,7 @@ struct ResponseToolState {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    announced_arguments: Option<String>,
     emitted_arguments: usize,
     started: bool,
     ended: bool,
@@ -275,6 +276,9 @@ impl Provider for OpenAiResponsesProvider {
                         if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                         if text_open { text_open = false; yield ModelEvent::TextEnd; }
                         for (index, tool) in tools.iter_mut().filter(|(_, tool)| tool.started && !tool.ended) {
+                            if let Some(delta) = take_unsent_arguments(tool, true) {
+                                yield ModelEvent::ToolCallArgumentsDelta { index: *index, delta };
+                            }
                             tool.ended = true;
                             yield ModelEvent::ToolCallEnd { index: *index };
                         }
@@ -740,6 +744,41 @@ fn reconcile_response_text(
     events
 }
 
+fn remember_announced_arguments(tool: &mut ResponseToolState, item: &Value) {
+    let Some(text) = json_text(item.get("arguments")) else {
+        return;
+    };
+    if tool.announced_arguments.is_none() && arguments_have_fields(&text) {
+        tool.announced_arguments = Some(text);
+    }
+}
+
+fn arguments_have_fields(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| !object.is_empty()))
+        .unwrap_or(false)
+}
+
+fn take_unsent_arguments(tool: &mut ResponseToolState, finish: bool) -> Option<String> {
+    if finish && !arguments_have_fields(&tool.arguments) {
+        if let Some(announced) = tool
+            .announced_arguments
+            .clone()
+            .filter(|text| arguments_have_fields(text))
+        {
+            tool.arguments = announced;
+            tool.emitted_arguments = 0;
+        }
+    }
+    if tool.emitted_arguments >= tool.arguments.len() {
+        return None;
+    }
+    let delta = tool.arguments[tool.emitted_arguments..].to_string();
+    tool.emitted_arguments = tool.arguments.len();
+    Some(delta)
+}
+
 fn update_response_tool(
     index: usize,
     item: &Value,
@@ -748,6 +787,7 @@ fn update_response_tool(
     tools: &mut std::collections::BTreeMap<usize, ResponseToolState>,
 ) -> Result<Vec<ModelEvent>> {
     let tool = tools.entry(index).or_default();
+    remember_announced_arguments(tool, item);
     if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
         tool.call_id.get_or_insert_with(|| call_id.into());
     }
@@ -781,10 +821,10 @@ fn update_response_tool(
             });
         }
     }
-    if tool.started && tool.emitted_arguments < tool.arguments.len() {
-        let delta = tool.arguments[tool.emitted_arguments..].to_string();
-        tool.emitted_arguments = tool.arguments.len();
-        events.push(ModelEvent::ToolCallArgumentsDelta { index, delta });
+    if tool.started {
+        if let Some(delta) = take_unsent_arguments(tool, done) {
+            events.push(ModelEvent::ToolCallArgumentsDelta { index, delta });
+        }
     }
     if done && !tool.ended {
         if !tool.started {
@@ -1096,6 +1136,36 @@ mod tests {
             _ => None,
         });
         assert_eq!(delta, Some(owned.as_str()));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCallEnd { index: 0 })));
+    }
+
+    #[test]
+    fn announced_function_arguments_survive_an_empty_argument_done() {
+        let item = json!({
+            "call_id": "call-1",
+            "name": "Read",
+            "arguments": {"path": "/tmp/file.py", "offset": 1, "limit": 300}
+        });
+        let mut tools = std::collections::BTreeMap::new();
+        update_response_tool(0, &item, ResponseToolArguments::None, false, &mut tools).unwrap();
+        let events = update_response_tool(
+            0,
+            &Value::Null,
+            ResponseToolArguments::Snapshot("{}"),
+            true,
+            &mut tools,
+        )
+        .unwrap();
+        let delta = events.iter().find_map(|event| match event {
+            ModelEvent::ToolCallArgumentsDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            delta,
+            Some(r#"{"limit":300,"offset":1,"path":"/tmp/file.py"}"#)
+        );
         assert!(events
             .iter()
             .any(|event| matches!(event, ModelEvent::ToolCallEnd { index: 0 })));
