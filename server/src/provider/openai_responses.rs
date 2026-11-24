@@ -26,7 +26,6 @@ struct ResponseToolState {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
-    announced_arguments: Option<String>,
     emitted_arguments: usize,
     started: bool,
     ended: bool,
@@ -176,7 +175,7 @@ impl Provider for OpenAiResponsesProvider {
                             if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                             let index = required_u64(&value, "output_index")? as usize;
                             saw_tool = true;
-                            for event in update_response_tool(index, item, ResponseToolArguments::None, false, &mut tools)? { yield event; }
+                            for event in update_response_tool(index, item, ResponseToolArguments::None, &mut tools)? { yield event; }
                         }
                     }
                     "response.output_item.done" => {
@@ -231,11 +230,7 @@ impl Provider for OpenAiResponsesProvider {
                                 if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                                 let index = required_u64(&value, "output_index")? as usize;
                                 saw_tool = true;
-                                let owned = json_text(item.get("arguments"));
-                                let arguments = owned
-                                    .as_deref()
-                                    .map_or(ResponseToolArguments::None, ResponseToolArguments::Snapshot);
-                                for event in update_response_tool(index, item, arguments, true, &mut tools)? { yield event; }
+                                for event in update_response_tool(index, item, ResponseToolArguments::None, &mut tools)? { yield event; }
                             }
                             _ => {}
                         }
@@ -244,30 +239,18 @@ impl Provider for OpenAiResponsesProvider {
                         let index = required_u64(&value, "output_index")? as usize;
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                             saw_tool = true;
-                            for event in update_response_tool(index, &Value::Null, ResponseToolArguments::Delta(delta), false, &mut tools)? { yield event; }
+                            for event in update_response_tool(index, &Value::Null, ResponseToolArguments::Delta(delta), &mut tools)? { yield event; }
                         }
                     }
                     "response.function_call_arguments.done" => {
                         let index = required_u64(&value, "output_index")? as usize;
+                        saw_tool = true;
                         let owned = json_text(value.get("arguments"));
-                        match owned.as_deref() {
-                            Some("") => {
-                                for event in update_response_tool(
-                                    index,
-                                    &Value::Null,
-                                    ResponseToolArguments::None,
-                                    false,
-                                    &mut tools,
-                                )? { yield event; }
-                            }
-                            arguments => {
-                                let arguments = arguments.map_or(
-                                    ResponseToolArguments::None,
-                                    ResponseToolArguments::Snapshot,
-                                );
-                                for event in update_response_tool(index, &Value::Null, arguments, true, &mut tools)? { yield event; }
-                            }
-                        }
+                        let arguments = owned.as_deref().map_or(
+                            ResponseToolArguments::None,
+                            ResponseToolArguments::Snapshot,
+                        );
+                        for event in update_response_tool(index, &Value::Null, arguments, &mut tools)? { yield event; }
                     }
                     "response.completed" | "response.incomplete" => {
                         let response = value.get("response").unwrap_or(&Value::Null);
@@ -275,16 +258,11 @@ impl Provider for OpenAiResponsesProvider {
                         for event in unseen_reasoning_events(response, &mut reasoning_items, &mut thinking_open) { yield event; }
                         if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                         if text_open { text_open = false; yield ModelEvent::TextEnd; }
-                        for (index, tool) in tools.iter_mut().filter(|(_, tool)| tool.started && !tool.ended) {
-                            if let Some(delta) = take_unsent_arguments(tool, true) {
-                                yield ModelEvent::ToolCallArgumentsDelta { index: *index, delta };
-                            }
-                            tool.ended = true;
-                            yield ModelEvent::ToolCallEnd { index: *index };
+                        let tool_events = finish_response_tools(&mut tools, response)?;
+                        if tool_events.iter().any(|event| matches!(event, ModelEvent::ToolCallEnd { .. })) {
+                            saw_tool = true;
                         }
-                        if kind == "response.completed" && tools.values().any(|tool| !tool.started) {
-                            Err(Error::Provider("OpenAI Responses completed with incomplete tool metadata".into()))?;
-                        }
+                        for event in tool_events { yield event; }
                         terminal = true;
                         if !reasoning_items.is_empty() {
                             yield ModelEvent::ProviderReplayState(
@@ -308,9 +286,14 @@ impl Provider for OpenAiResponsesProvider {
             if !terminal && saw_completed_item {
                 if thinking_open { yield ModelEvent::ThinkingEnd; }
                 if text_open { yield ModelEvent::TextEnd; }
-                if tools.values().any(|tool| !tool.ended) {
+                if tools.values().any(|tool| !tool.ended && !tool_call_is_settled(tool)) {
                     Err(Error::Provider("OpenAI Responses stream ended with an incomplete tool call".into()))?;
                 }
+                let tool_events = finish_response_tools(&mut tools, &Value::Null)?;
+                if tool_events.iter().any(|event| matches!(event, ModelEvent::ToolCallEnd { .. })) {
+                    saw_tool = true;
+                }
+                for event in tool_events { yield event; }
                 terminal = true;
                 if !reasoning_items.is_empty() {
                     yield ModelEvent::ProviderReplayState(crate::model::ProviderReplayState {
@@ -744,15 +727,6 @@ fn reconcile_response_text(
     events
 }
 
-fn remember_announced_arguments(tool: &mut ResponseToolState, item: &Value) {
-    let Some(text) = json_text(item.get("arguments")) else {
-        return;
-    };
-    if tool.announced_arguments.is_none() && arguments_have_fields(&text) {
-        tool.announced_arguments = Some(text);
-    }
-}
-
 fn arguments_have_fields(text: &str) -> bool {
     serde_json::from_str::<Value>(text)
         .ok()
@@ -760,17 +734,55 @@ fn arguments_have_fields(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn take_unsent_arguments(tool: &mut ResponseToolState, finish: bool) -> Option<String> {
-    if finish && !arguments_have_fields(&tool.arguments) {
-        if let Some(announced) = tool
-            .announced_arguments
-            .clone()
-            .filter(|text| arguments_have_fields(text))
-        {
-            tool.arguments = announced;
-            tool.emitted_arguments = 0;
-        }
+fn arguments_are_settled(text: &str) -> bool {
+    text.is_empty() || text == "{}" || arguments_have_fields(text)
+}
+
+fn tool_call_is_settled(tool: &ResponseToolState) -> bool {
+    tool.started && arguments_are_settled(&tool.arguments)
+}
+
+fn apply_argument_snapshot(tool: &mut ResponseToolState, snapshot: &str) -> Result<()> {
+    if !arguments_have_fields(snapshot) {
+        return Ok(());
     }
+    if !arguments_have_fields(&tool.arguments) {
+        tool.arguments = snapshot.to_string();
+        tool.emitted_arguments = 0;
+        return Ok(());
+    }
+    if snapshot == tool.arguments
+        || snapshot.starts_with(&tool.arguments)
+        || json_values_match(&tool.arguments, snapshot)
+    {
+        if snapshot.starts_with(&tool.arguments) && snapshot.len() > tool.arguments.len() {
+            let suffix = &snapshot[tool.arguments.len()..];
+            tool.arguments.push_str(suffix);
+        }
+        return Ok(());
+    }
+    Err(Error::Provider(
+        "OpenAI Responses final tool arguments do not match streamed arguments".into(),
+    ))
+}
+
+fn apply_tool_arguments(
+    tool: &mut ResponseToolState,
+    arguments: ResponseToolArguments<'_>,
+) -> Result<()> {
+    match arguments {
+        ResponseToolArguments::None => Ok(()),
+        ResponseToolArguments::Delta(delta) => {
+            if !delta.is_empty() {
+                tool.arguments.push_str(delta);
+            }
+            Ok(())
+        }
+        ResponseToolArguments::Snapshot(snapshot) => apply_argument_snapshot(tool, snapshot),
+    }
+}
+
+fn take_unsent_arguments(tool: &mut ResponseToolState) -> Option<String> {
     if tool.emitted_arguments >= tool.arguments.len() {
         return None;
     }
@@ -783,32 +795,19 @@ fn update_response_tool(
     index: usize,
     item: &Value,
     arguments: ResponseToolArguments<'_>,
-    done: bool,
     tools: &mut std::collections::BTreeMap<usize, ResponseToolState>,
 ) -> Result<Vec<ModelEvent>> {
     let tool = tools.entry(index).or_default();
-    remember_announced_arguments(tool, item);
     if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
         tool.call_id.get_or_insert_with(|| call_id.into());
     }
     if let Some(name) = item.get("name").and_then(Value::as_str) {
         tool.name.get_or_insert_with(|| name.into());
     }
-    match arguments {
-        ResponseToolArguments::None => {}
-        ResponseToolArguments::Delta(delta) => tool.arguments.push_str(delta),
-        ResponseToolArguments::Snapshot(snapshot) if snapshot == tool.arguments => {}
-        ResponseToolArguments::Snapshot(snapshot) if snapshot.starts_with(&tool.arguments) => {
-            tool.arguments.push_str(&snapshot[tool.arguments.len()..]);
-        }
-        ResponseToolArguments::Snapshot(snapshot)
-            if json_values_match(&tool.arguments, snapshot) => {}
-        ResponseToolArguments::Snapshot(_) => {
-            return Err(Error::Provider(
-                "OpenAI Responses final tool arguments do not match streamed arguments".into(),
-            ));
-        }
+    if let Some(text) = json_text(item.get("arguments")) {
+        apply_argument_snapshot(tool, &text)?;
     }
+    apply_tool_arguments(tool, arguments)?;
 
     let mut events = Vec::new();
     if !tool.started {
@@ -821,21 +820,80 @@ fn update_response_tool(
             });
         }
     }
-    if tool.started {
-        if let Some(delta) = take_unsent_arguments(tool, done) {
-            events.push(ModelEvent::ToolCallArgumentsDelta { index, delta });
-        }
+    Ok(events)
+}
+
+fn finish_response_tools(
+    tools: &mut std::collections::BTreeMap<usize, ResponseToolState>,
+    response: &Value,
+) -> Result<Vec<ModelEvent>> {
+    let mut events = apply_completed_function_calls(tools, response)?;
+    if tools.values().any(|tool| !tool.started) {
+        return Err(Error::Provider(
+            "OpenAI Responses completed with incomplete tool metadata".into(),
+        ));
     }
-    if done && !tool.ended {
-        if !tool.started {
-            return Err(Error::Provider(
-                "OpenAI Responses function call is missing call_id or name".into(),
-            ));
+    for (index, tool) in tools.iter_mut() {
+        if tool.ended {
+            continue;
+        }
+        if let Some(delta) = take_unsent_arguments(tool) {
+            events.push(ModelEvent::ToolCallArgumentsDelta {
+                index: *index,
+                delta,
+            });
         }
         tool.ended = true;
-        events.push(ModelEvent::ToolCallEnd { index });
+        events.push(ModelEvent::ToolCallEnd { index: *index });
     }
     Ok(events)
+}
+
+fn apply_completed_function_calls(
+    tools: &mut std::collections::BTreeMap<usize, ResponseToolState>,
+    response: &Value,
+) -> Result<Vec<ModelEvent>> {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut events = Vec::new();
+    for (position, item) in output.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let call_id = item.get("call_id").and_then(Value::as_str);
+        let matched = call_id.and_then(|call_id| {
+            tools
+                .iter()
+                .find(|(_, tool)| tool.call_id.as_deref() == Some(call_id))
+                .map(|(index, _)| *index)
+        });
+        let index = match matched {
+            Some(index) => index,
+            None if tool_slot_accepts(tools.get(&position), call_id) => position,
+            None => (0..)
+                .find(|index| !tools.contains_key(index))
+                .unwrap_or(position),
+        };
+        events.extend(update_response_tool(
+            index,
+            item,
+            ResponseToolArguments::None,
+            tools,
+        )?);
+    }
+    Ok(events)
+}
+
+fn tool_slot_accepts(tool: Option<&ResponseToolState>, call_id: Option<&str>) -> bool {
+    match tool {
+        None => true,
+        Some(tool) => match (tool.call_id.as_deref(), call_id) {
+            (None, _) => true,
+            (Some(existing), Some(call_id)) => existing == call_id,
+            (Some(_), None) => false,
+        },
+    }
 }
 
 fn apply_model(
@@ -1123,18 +1181,9 @@ mod tests {
         });
         let owned = json_text(item.get("arguments")).expect("object arguments");
         let mut tools = std::collections::BTreeMap::new();
-        let events = update_response_tool(
-            0,
-            &item,
-            ResponseToolArguments::Snapshot(&owned),
-            true,
-            &mut tools,
-        )
-        .unwrap();
-        let delta = events.iter().find_map(|event| match event {
-            ModelEvent::ToolCallArgumentsDelta { delta, .. } => Some(delta.as_str()),
-            _ => None,
-        });
+        update_response_tool(0, &item, ResponseToolArguments::None, &mut tools).unwrap();
+        let events = finish_response_tools(&mut tools, &Value::Null).unwrap();
+        let delta = argument_delta(&events);
         assert_eq!(delta, Some(owned.as_str()));
         assert!(events
             .iter()
@@ -1142,33 +1191,93 @@ mod tests {
     }
 
     #[test]
-    fn announced_function_arguments_survive_an_empty_argument_done() {
+    fn empty_argument_event_keeps_the_opening_object() {
         let item = json!({
             "call_id": "call-1",
             "name": "Read",
             "arguments": {"path": "/tmp/file.py", "offset": 1, "limit": 300}
         });
         let mut tools = std::collections::BTreeMap::new();
-        update_response_tool(0, &item, ResponseToolArguments::None, false, &mut tools).unwrap();
-        let events = update_response_tool(
+        update_response_tool(0, &item, ResponseToolArguments::None, &mut tools).unwrap();
+        update_response_tool(
             0,
             &Value::Null,
             ResponseToolArguments::Snapshot("{}"),
-            true,
             &mut tools,
         )
         .unwrap();
-        let delta = events.iter().find_map(|event| match event {
-            ModelEvent::ToolCallArgumentsDelta { delta, .. } => Some(delta.as_str()),
-            _ => None,
-        });
+        let events = finish_response_tools(&mut tools, &Value::Null).unwrap();
         assert_eq!(
-            delta,
+            argument_delta(&events),
             Some(r#"{"limit":300,"offset":1,"path":"/tmp/file.py"}"#)
         );
         assert!(events
             .iter()
             .any(|event| matches!(event, ModelEvent::ToolCallEnd { index: 0 })));
+    }
+
+    #[test]
+    fn completed_output_fills_an_empty_argument_buffer() {
+        let item = json!({
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": ""
+        });
+        let mut tools = std::collections::BTreeMap::new();
+        update_response_tool(0, &item, ResponseToolArguments::None, &mut tools).unwrap();
+        update_response_tool(
+            0,
+            &Value::Null,
+            ResponseToolArguments::Delta("{}"),
+            &mut tools,
+        )
+        .unwrap();
+        let response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": {"path": "/tmp/file.py", "offset": 1, "limit": 300}
+            }]
+        });
+        let events = finish_response_tools(&mut tools, &response).unwrap();
+        assert_eq!(
+            argument_delta(&events),
+            Some(r#"{"limit":300,"offset":1,"path":"/tmp/file.py"}"#)
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCallEnd { index: 0 })));
+    }
+
+    #[test]
+    fn different_argument_objects_still_conflict() {
+        let item = json!({
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": {"path": "/tmp/a.py"}
+        });
+        let mut tools = std::collections::BTreeMap::new();
+        update_response_tool(0, &item, ResponseToolArguments::None, &mut tools).unwrap();
+        let response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": {"path": "/tmp/b.py"}
+            }]
+        });
+        let error = finish_response_tools(&mut tools, &response).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("do not match streamed arguments"));
+    }
+
+    fn argument_delta(events: &[ModelEvent]) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            ModelEvent::ToolCallArgumentsDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
     }
 
     #[test]
