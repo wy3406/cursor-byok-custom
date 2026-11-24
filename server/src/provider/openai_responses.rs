@@ -29,6 +29,7 @@ struct ResponseToolState {
     emitted_arguments: usize,
     started: bool,
     ended: bool,
+    argument_delta_events: u32,
 }
 
 enum ResponseToolArguments<'a> {
@@ -175,7 +176,11 @@ impl Provider for OpenAiResponsesProvider {
                             if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                             let index = required_u64(&value, "output_index")? as usize;
                             saw_tool = true;
+                            note_tool_argument_shape(kind, Some(index as u64), item);
                             for event in update_response_tool(index, item, ResponseToolArguments::None, &mut tools)? { yield event; }
+                        } else if argument_bearing(item) {
+                            let index = value.get("output_index").and_then(Value::as_u64);
+                            note_tool_argument_shape(kind, index, item);
                         }
                     }
                     "response.output_item.done" => {
@@ -230,7 +235,12 @@ impl Provider for OpenAiResponsesProvider {
                                 if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                                 let index = required_u64(&value, "output_index")? as usize;
                                 saw_tool = true;
+                                note_tool_argument_shape(kind, Some(index as u64), item);
                                 for event in update_response_tool(index, item, ResponseToolArguments::None, &mut tools)? { yield event; }
+                            }
+                            _ if argument_bearing(item) => {
+                                let index = value.get("output_index").and_then(Value::as_u64);
+                                note_tool_argument_shape(kind, index, item);
                             }
                             _ => {}
                         }
@@ -239,12 +249,19 @@ impl Provider for OpenAiResponsesProvider {
                         let index = required_u64(&value, "output_index")? as usize;
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                             saw_tool = true;
+                            if argument_shape_is_boundary(delta) {
+                                note_tool_argument_shape(kind, Some(index as u64), &value);
+                            }
                             for event in update_response_tool(index, &Value::Null, ResponseToolArguments::Delta(delta), &mut tools)? { yield event; }
+                            if let Some(tool) = tools.get_mut(&index) {
+                                tool.argument_delta_events = tool.argument_delta_events.saturating_add(1);
+                            }
                         }
                     }
                     "response.function_call_arguments.done" => {
                         let index = required_u64(&value, "output_index")? as usize;
                         saw_tool = true;
+                        note_tool_argument_shape(kind, Some(index as u64), &value);
                         let owned = json_text(value.get("arguments"));
                         let arguments = owned.as_deref().map_or(
                             ResponseToolArguments::None,
@@ -280,7 +297,7 @@ impl Provider for OpenAiResponsesProvider {
                             FinishReason::Stop
                         });
                     }
-                    _ => {}
+                    _ => note_unknown_tool_shape(kind, &value),
                 }
             }
             if !terminal && saw_completed_item {
@@ -843,6 +860,14 @@ fn finish_response_tools(
                 delta,
             });
         }
+        if !arguments_have_fields(&tool.arguments) {
+            tracing::info!(
+                tool = tool.name.as_deref().unwrap_or(""),
+                arguments = %string_argument_shape(&tool.arguments),
+                argument_delta_events = tool.argument_delta_events,
+                "responses tool call finished without argument fields"
+            );
+        }
         tool.ended = true;
         events.push(ModelEvent::ToolCallEnd { index: *index });
     }
@@ -875,6 +900,7 @@ fn apply_completed_function_calls(
                 .find(|index| !tools.contains_key(index))
                 .unwrap_or(position),
         };
+        note_tool_argument_shape("response.output", Some(index as u64), item);
         events.extend(update_response_tool(
             index,
             item,
@@ -1051,6 +1077,135 @@ fn role_name(role: &Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }
+}
+
+const ARGUMENT_FIELDS: &[&str] = &[
+    "arguments",
+    "delta",
+    "parsed_arguments",
+    "args",
+    "parameters",
+];
+
+fn note_tool_argument_shape(event: &str, index: Option<u64>, value: &Value) {
+    let item_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    tracing::info!(
+        event,
+        output_index = index,
+        item_type,
+        keys = %value_keys(value),
+        arguments = %argument_field_shapes(value),
+        "responses tool argument shape"
+    );
+}
+
+fn note_unknown_tool_shape(kind: &str, value: &Value) {
+    let kind_name = kind.to_ascii_lowercase();
+    let named = kind_name.contains("function")
+        || kind_name.contains("tool")
+        || kind_name.contains("argument");
+    if named && argument_bearing(value) {
+        let index = value.get("output_index").and_then(Value::as_u64);
+        note_tool_argument_shape(kind, index, value);
+        return;
+    }
+    let items = value
+        .get("output")
+        .and_then(Value::as_array)
+        .or_else(|| value.pointer("/response/output").and_then(Value::as_array));
+    if let Some(items) = items {
+        for item in items.iter().filter(|item| argument_bearing(item)) {
+            note_tool_argument_shape(kind, None, item);
+        }
+    }
+}
+
+fn argument_bearing(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let kind = object.get("type").and_then(Value::as_str).unwrap_or("");
+    kind.contains("function")
+        || kind.contains("tool")
+        || ARGUMENT_FIELDS
+            .iter()
+            .any(|name| object.contains_key(*name))
+}
+
+fn argument_shape_is_boundary(text: &str) -> bool {
+    text.is_empty() || text == "{}" || arguments_have_fields(text)
+}
+
+fn value_keys(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return "-".into();
+    };
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.join(",")
+}
+
+fn argument_field_shapes(value: &Value) -> String {
+    argument_field_shapes_at(value, 0)
+}
+
+fn argument_field_shapes_at(value: &Value, depth: usize) -> String {
+    let Some(object) = value.as_object() else {
+        return argument_shape(Some(value));
+    };
+    let mut parts = Vec::new();
+    for name in ARGUMENT_FIELDS {
+        if let Some(field) = object.get(*name) {
+            parts.push(format!("{name}={}", argument_shape(Some(field))));
+        }
+    }
+    if depth < 2 {
+        for name in ["function_call", "tool_call", "item"] {
+            let Some(nested) = object.get(name).filter(|nested| argument_bearing(nested)) else {
+                continue;
+            };
+            let nested_shape = argument_field_shapes_at(nested, depth + 1);
+            if nested_shape != "none" {
+                parts.push(format!("{name}={nested_shape}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn argument_shape(value: Option<&Value>) -> String {
+    match value {
+        None => "absent".into(),
+        Some(Value::Null) => "null".into(),
+        Some(Value::Bool(_)) => "bool".into(),
+        Some(Value::Number(_)) => "number".into(),
+        Some(Value::String(text)) => string_argument_shape(text),
+        Some(Value::Array(items)) => format!("array len={}", items.len()),
+        Some(Value::Object(object)) => object_argument_shape(object),
+    }
+}
+
+fn string_argument_shape(text: &str) -> String {
+    if text.is_empty() {
+        return "empty_string".into();
+    }
+    if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text) {
+        return object_argument_shape(&object);
+    }
+    format!("string len={}", text.len())
+}
+
+fn object_argument_shape(object: &Map<String, Value>) -> String {
+    if object.is_empty() {
+        return "empty_object".into();
+    }
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    format!("object keys={}", keys.join(","))
 }
 
 fn json_text(value: Option<&Value>) -> Option<String> {
@@ -1378,6 +1533,24 @@ mod tests {
             "summary": [{"type": "summary_text", "text": "why"}]
         });
         assert_eq!(reasoning_visible_text(&item), "why");
+    }
+
+    #[test]
+    fn argument_shape_records_field_names_without_values() {
+        let value = json!({
+            "type": "function_call",
+            "name": "Grep",
+            "arguments": {"pattern": "secret-pattern", "path": "/secret/file.py"},
+            "parsed_arguments": "{}"
+        });
+        let shape = argument_field_shapes(&value);
+        assert!(shape.contains("arguments=object keys=path,pattern"));
+        assert!(shape.contains("parsed_arguments=empty_object"));
+        assert!(!shape.contains("secret"));
+        assert!(!shape.contains("file.py"));
+        assert_eq!(string_argument_shape(""), "empty_string");
+        assert_eq!(string_argument_shape("{}"), "empty_object");
+        assert_eq!(string_argument_shape("not-json"), "string len=8");
     }
 
     #[test]

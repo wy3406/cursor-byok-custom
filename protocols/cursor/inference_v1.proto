@@ -188,7 +188,31 @@ message RunInferencePromptModelMetadata {
   bool is_grok46_product_prompt = 34;
   bool is_fable51 = 43;
   string self_identity_name = 44;
+  RunInferenceSubagentModelConfig subagent_model_config = 49;
   bool is_opus55 = 50;
+}
+
+// Field numbers follow the Cursor agent host schema. force_policy is one of
+// none, parent_pin, request_based_composer. slug is the model id Cursor
+// already uses to start a run.
+message RunInferenceSubagentModelConfig {
+  string force_policy = 1;
+  optional string force_model_id = 2;
+  bool parent_max_mode = 3;
+  repeated RunInferenceSubagentModelPolicy models = 4;
+  reserved 5;
+  bool task_tool_omitted = 6;
+  string parent_requested_model_name = 7;
+}
+
+message RunInferenceSubagentModelPolicy {
+  string slug = 1;
+  bool advertised = 2;
+  bool valid = 3;
+  bool blocked = 4;
+  bool requires_max_mode = 5;
+  double representative_cost_dollars = 6;
+  repeated string legacy_aliases = 7;
 }
 
 message RunInferenceRunReady {

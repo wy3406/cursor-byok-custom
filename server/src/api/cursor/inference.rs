@@ -35,16 +35,18 @@ use crate::{
                 RunInferenceInvocationError, RunInferenceInvocationResponse,
                 RunInferenceInvokeModel, RunInferencePromptModelMetadata,
                 RunInferenceRoutingMessage, RunInferenceRunReady, RunInferenceRunRequest,
-                RunInferenceServerMessage,
+                RunInferenceServerMessage, RunInferenceSubagentModelConfig,
+                RunInferenceSubagentModelPolicy,
             },
         },
         transport::{TransportHandle, TransportParent, TransportRegistry},
     },
     model::{
-        ContentPart, ModelInvocation, ModelLatency, ModelRequest, ModelSpec, ModelType,
-        ProjectedContent, ProjectedMessage, PromptSpec, Role, ToolCallContent, ToolDefinition,
-        ToolResultContent,
+        ContentPart, ModelConfig, ModelInvocation, ModelLatency, ModelRequest, ModelSpec,
+        ModelType, ProjectedContent, ProjectedMessage, PromptSpec, Role, ToolCallContent,
+        ToolDefinition, ToolResultContent,
     },
+    plugin::PluginModelDescriptor,
     provider::ModelEvent,
     Error, Result,
 };
@@ -853,6 +855,95 @@ pub fn local_prompt_metadata(
     metadata
 }
 
+struct SubagentModelRecord {
+    slug: String,
+    aliases: Vec<String>,
+}
+
+fn subagent_record(slug: &str, display_name: &str, provider_model_id: &str) -> SubagentModelRecord {
+    SubagentModelRecord {
+        slug: slug.to_owned(),
+        aliases: vec![display_name.to_owned(), provider_model_id.to_owned()],
+    }
+}
+
+fn configured_subagent_models(
+    models: &[ModelConfig],
+    plugins: &[PluginModelDescriptor],
+) -> Vec<SubagentModelRecord> {
+    let mut records = Vec::with_capacity(models.len() + plugins.len());
+    for model in models {
+        records.push(subagent_record(
+            &model.model_hash,
+            &model.display_name,
+            &model.model_id,
+        ));
+    }
+    for model in plugins {
+        records.push(subagent_record(
+            &model.id,
+            &model.display_name,
+            &model.model_id,
+        ));
+    }
+    records
+}
+
+fn subagent_model_config(
+    parent_model_id: &str,
+    parent_max_mode: bool,
+    models: Vec<SubagentModelRecord>,
+) -> Option<RunInferenceSubagentModelConfig> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for model in models {
+        let slug = model.slug.trim();
+        if slug.is_empty() || !seen.insert(slug.to_owned()) {
+            continue;
+        }
+        let mut aliases = Vec::new();
+        for alias in model.aliases {
+            let alias = alias.trim();
+            if alias.is_empty() || alias == slug || aliases.iter().any(|existing| existing == alias)
+            {
+                continue;
+            }
+            aliases.push(alias.to_owned());
+        }
+        entries.push(RunInferenceSubagentModelPolicy {
+            slug: slug.to_owned(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            requires_max_mode: false,
+            representative_cost_dollars: 0.0,
+            legacy_aliases: aliases,
+        });
+    }
+    if !parent_model_id.is_empty() && seen.insert(parent_model_id.to_owned()) {
+        entries.push(RunInferenceSubagentModelPolicy {
+            slug: parent_model_id.to_owned(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            requires_max_mode: false,
+            representative_cost_dollars: 0.0,
+            legacy_aliases: Vec::new(),
+        });
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(RunInferenceSubagentModelConfig {
+        force_policy: "none".into(),
+        force_model_id: None,
+        parent_max_mode,
+        models: entries,
+        task_tool_omitted: false,
+        parent_requested_model_name: parent_model_id.to_owned(),
+    })
+}
+
 fn prompt_self_identity(display_name: &str, provider_model_id: &str) -> String {
     if !display_name.is_empty() {
         display_name.to_owned()
@@ -889,7 +980,7 @@ async fn open_run(
     table.insert(handle.request_id().to_owned(), session);
     drop(table);
     let model_id = model.model_id.clone();
-    let metadata = if model_id.is_empty() {
+    let mut metadata = if model_id.is_empty() {
         local_prompt_metadata(None, "", "")
     } else {
         match registry.store().model(&model_id).await? {
@@ -901,6 +992,16 @@ async fn open_run(
             None => local_prompt_metadata(None, "", &model_id),
         }
     };
+    let stored_models = registry.store().models().await?;
+    let plugin_models = match registry.plugins() {
+        Some(plugins) => plugins.configured_models().await,
+        None => Vec::new(),
+    };
+    metadata.subagent_model_config = subagent_model_config(
+        &model_id,
+        model.max_mode,
+        configured_subagent_models(&stored_models, &plugin_models),
+    );
     if !emit(
         handle,
         &server(run_inference_server_message::Message::RunReady(
@@ -1470,6 +1571,56 @@ mod tests {
         let mut bytes = Vec::new();
         message.encode(&mut bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn subagent_model_config_advertises_the_configured_models() {
+        let config = super::subagent_model_config(
+            "parent-hash",
+            true,
+            vec![
+                super::subagent_record("parent-hash", "claude-sonnet-5-5", "claude-sonnet-5-5"),
+                super::subagent_record("haiku-hash", "claude-haiku-5-5", "claude-haiku-5-5"),
+            ],
+        )
+        .expect("configured models produce a catalog");
+        assert_eq!(config.force_policy, "none");
+        assert!(config.force_model_id.is_none());
+        assert!(!config.task_tool_omitted);
+        assert!(config.parent_max_mode);
+        assert_eq!(config.parent_requested_model_name, "parent-hash");
+        assert_eq!(config.models.len(), 2);
+        let haiku = config
+            .models
+            .iter()
+            .find(|model| model.slug == "haiku-hash")
+            .expect("haiku");
+        assert!(haiku.advertised);
+        assert!(haiku.valid);
+        assert!(!haiku.blocked);
+        assert!(!haiku.requires_max_mode);
+        assert_eq!(haiku.legacy_aliases, vec!["claude-haiku-5-5".to_owned()]);
+        let metadata = super::RunInferencePromptModelMetadata {
+            subagent_model_config: Some(config),
+            ..Default::default()
+        };
+        let encoded = encode(&metadata);
+        assert!(
+            encoded.windows(2).any(|bytes| bytes == [0x8a, 0x03]),
+            "subagent_model_config is field 49"
+        );
+        let decoded = super::RunInferencePromptModelMetadata::decode(encoded.as_slice()).unwrap();
+        let catalog = decoded.subagent_model_config.expect("catalog");
+        assert_eq!(catalog.models[1].slug, "haiku-hash");
+        assert_eq!(
+            catalog.models[1].legacy_aliases,
+            vec!["claude-haiku-5-5".to_owned()]
+        );
+    }
+
+    #[test]
+    fn subagent_model_config_stays_absent_without_models() {
+        assert!(super::subagent_model_config("", false, Vec::new()).is_none());
     }
 
     #[test]
